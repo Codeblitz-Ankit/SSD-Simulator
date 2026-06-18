@@ -1,0 +1,58 @@
+#include "Block.h"
+
+Block::Block(int numPages) {
+    eraseCount = 0;
+
+    for (int i = 0; i < numPages; i++) {
+        pages.push_back(Page());
+    }
+}
+
+Page& Block::getPage(int index) {
+    return pages[index];
+}
+
+int Block::getFreePageIndex() const {
+
+    for (int i = 0; i < pages.size(); i++) {
+
+        if (pages[i].getIsFree()) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
+int Block::getEraseCount() const {
+    return eraseCount;
+}
+
+void Block::eraseBlock() {
+
+    for (int i = 0; i < pages.size(); i++) {
+        pages[i] = Page();
+    }
+
+    eraseCount++;
+}
+
+int Block::getTotalPages() const {
+    return pages.size();
+}
+
+int Block::getInvalidPageCount() const {
+
+    int count = 0;
+
+    for (int i = 0; i < pages.size(); i++) {
+
+        if (!pages[i].getIsFree() &&
+            !pages[i].getIsValid()) {
+
+            count++;
+        }
+    }
+
+    return count;
+}
