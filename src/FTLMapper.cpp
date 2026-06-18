@@ -34,3 +34,18 @@ PhysicalAddress FTLMapper::removeMapping(
     return addr;
 }
 
+int FTLMapper::findLogicalAddress(
+    const PhysicalAddress& physAddr
+) const {
+
+    for (const auto& entry : mappingTable) {
+
+        if (entry.second.blockIndex == physAddr.blockIndex &&
+            entry.second.pageIndex  == physAddr.pageIndex) {
+
+            return entry.first;     // return the LBA
+        }
+    }
+
+    return -1;  // no LBA maps to this physical address
+}

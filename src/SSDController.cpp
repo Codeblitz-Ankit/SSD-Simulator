@@ -1,150 +1,136 @@
 #include "SSDController.h"
 #include <iostream>
 
+// ─── Constructor ─────────────────────────────────────────────────────────────
+//
+// Member initialisation order must match declaration order in the header:
+//   flashMemory → mapper → stats → gc → lowWatermarkPercent
+//
+// GarbageCollector holds references to flashMemory, mapper, and stats, so those
+// three must be fully constructed first — which is guaranteed by declaration order.
+
 SSDController::SSDController(
-    int numBlocks,
-    int pagesPerBlock
+    int    numBlocks,
+    int    pagesPerBlock,
+    double lowWatermark
 )
-    : flashMemory(
-          numBlocks,
-          pagesPerBlock
-      ) {}
+    : flashMemory(numBlocks, pagesPerBlock),
+      mapper(),
+      stats(),
+      gc(flashMemory, mapper, stats),
+      lowWatermarkPercent(lowWatermark)
+{}
+
+// ─── Write ────────────────────────────────────────────────────────────────────
 
 void SSDController::write(
     int logicalAddress,
     const std::string& data
 ) {
-    int freeBlock =
-        flashMemory.findLeastUsedFreeBlock();
+    // 1. Count this as one logical write from the host
+    stats.recordLogicalWrite();
+
+    // 2. Trigger GC if free-page ratio has dropped below the watermark
+    if (gc.shouldTrigger(lowWatermarkPercent)) {
+        gc.runOneCycle();
+    }
+
+    // 3. Find a free block (prefer lowest erase count → basic wear levelling)
+    int freeBlock = flashMemory.findLeastUsedFreeBlock();
 
     if (freeBlock == -1) {
+        // Watermark GC wasn't enough — run one more forced cycle
+        std::cout << "[SSD] No free block found, forcing extra GC cycle...\n";
+        gc.runOneCycle();
+        freeBlock = flashMemory.findLeastUsedFreeBlock();
 
-        std::cout
-            << "ERROR: SSD FULL\n";
-
-        return;
+        if (freeBlock == -1) {
+            std::cout << "ERROR: SSD FULL — write of LBA "
+                      << logicalAddress << " dropped.\n";
+            return;
+        }
     }
 
     int freePage =
-        flashMemory.getBlock(
-            freeBlock
-        ).getFreePageIndex();
+        flashMemory.getBlock(freeBlock).getFreePageIndex();
 
-    flashMemory.getBlock(
-        freeBlock
-    ).getPage(
-        freePage
-    ).writeData(data);
+    // 4. Program the page
+    flashMemory.getBlock(freeBlock)
+               .getPage(freePage)
+               .writeData(data);
 
-    PhysicalAddress addr;
+    stats.recordPhysicalWrite();   // host write counts as one physical write
 
-    addr.blockIndex = freeBlock;
-    addr.pageIndex = freePage;
+    // 5. Invalidate the previously mapped physical page (out-of-place update)
+    PhysicalAddress newAddr;
+    newAddr.blockIndex = freeBlock;
+    newAddr.pageIndex  = freePage;
 
     if (mapper.hasMapping(logicalAddress)) {
 
-        PhysicalAddress oldAddr =
-            mapper.removeMapping(
-                logicalAddress
-            );
+        PhysicalAddress oldAddr = mapper.removeMapping(logicalAddress);
 
-        flashMemory.getBlock(
-            oldAddr.blockIndex
-        ).getPage(
-            oldAddr.pageIndex
-        ).invalidate();
+        flashMemory.getBlock(oldAddr.blockIndex)
+                   .getPage(oldAddr.pageIndex)
+                   .invalidate();
     }
 
-    mapper.mapLogicalToPhysical(
-        logicalAddress,
-        addr
-    );
+    // 6. Update FTL mapping: LBA → new physical address
+    mapper.mapLogicalToPhysical(logicalAddress, newAddr);
 }
+
+// ─── Read ─────────────────────────────────────────────────────────────────────
 
 std::string SSDController::read(
     int logicalAddress
 ) {
+    if (!mapper.hasMapping(logicalAddress)) {
+        return "[ERROR: LBA " + std::to_string(logicalAddress) + " not mapped]";
+    }
 
-    PhysicalAddress addr =
-        mapper.getPhysicalAddress(
-            logicalAddress
-        );
+    PhysicalAddress addr = mapper.getPhysicalAddress(logicalAddress);
 
-    return flashMemory.getBlock(
-               addr.blockIndex
-           ).getPage(
-               addr.pageIndex
-           ).readData();
+    return flashMemory.getBlock(addr.blockIndex)
+                      .getPage(addr.pageIndex)
+                      .readData();
 }
+
+// ─── Manual GC trigger ────────────────────────────────────────────────────────
+
+void SSDController::garbageCollect() {
+    gc.runOneCycle();
+}
+
+// ─── displayStatus ────────────────────────────────────────────────────────────
 
 void SSDController::displayStatus() {
 
-    std::cout
-        << "\n===== SSD STATUS =====\n";
+    std::cout << "\n===== SSD BLOCK STATUS =====\n";
 
-    for (int i = 0;
-         i < flashMemory.getTotalBlocks();
-         i++) {
+    for (int i = 0; i < flashMemory.getTotalBlocks(); i++) {
 
-        Block& block =
-            flashMemory.getBlock(i);
+        Block& block = flashMemory.getBlock(i);
 
-        int freePages = 0;
-        int validPages = 0;
-        int invalidPages = 0;
-
-        for (int j = 0;
-             j < block.getTotalPages();
-             j++) {
-
-            Page& page =
-                block.getPage(j);
-
-            if (page.getIsFree()) {
-                freePages++;
-            }
-            else if (page.getIsValid()) {
-                validPages++;
-            }
-            else {
-                invalidPages++;
-            }
-        }
-
-        std::cout
-            << "Block " << i
-            << " | Free: " << freePages
-            << " | Valid: " << validPages
-            << " | Invalid: " << invalidPages
-            << " | Erase Count: "
-            << block.getEraseCount()
-            << std::endl;
+        std::cout << "  Block " << i
+                  << " | Free: "    << block.getFreePageCount()
+                  << " | Valid: "   << block.getValidPageCount()
+                  << " | Invalid: " << block.getInvalidPageCount()
+                  << " | Erases: "  << block.getEraseCount()
+                  << "\n";
     }
 
-    std::cout
-        << "======================\n";
+    int total = flashMemory.getTotalPageCount();
+    int free  = flashMemory.getFreePageCount();
+
+    std::cout << "  ─────────────────────────────────────\n";
+    std::cout << "  Total pages : " << total
+              << "  |  Free: "      << free
+              << "  |  Used: "      << (total - free) << "\n";
+    std::cout << "============================\n";
 }
 
-void SSDController::garbageCollect() {
+// ─── printStats ───────────────────────────────────────────────────────────────
 
-    for (int i = 0;
-         i < flashMemory.getTotalBlocks();
-         i++) {
-
-        Block& block =
-            flashMemory.getBlock(i);
-
-        int invalidPages =
-            block.getInvalidPageCount();
-
-        if (invalidPages ==
-            block.getTotalPages()) {
-
-            std::cout
-                << "Garbage Collecting Block "
-                << i << std::endl;
-
-            block.eraseBlock();
-        }
-    }
+void SSDController::printStats() const {
+    stats.printReport();
 }

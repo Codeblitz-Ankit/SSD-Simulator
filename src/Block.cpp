@@ -12,6 +12,10 @@ Page& Block::getPage(int index) {
     return pages[index];
 }
 
+const Page& Block::getPage(int index) const {
+    return pages[index];
+}
+
 int Block::getFreePageIndex() const {
 
     for (int i = 0; i < pages.size(); i++) {
@@ -52,6 +56,28 @@ int Block::getInvalidPageCount() const {
 
             count++;
         }
+    }
+
+    return count;
+}
+
+int Block::getFreePageCount() const {
+
+    int count = 0;
+
+    for (int i = 0; i < (int)pages.size(); i++) {
+        if (pages[i].getIsFree()) count++;
+    }
+
+    return count;
+}
+
+int Block::getValidPageCount() const {
+
+    int count = 0;
+
+    for (int i = 0; i < (int)pages.size(); i++) {
+        if (!pages[i].getIsFree() && pages[i].getIsValid()) count++;
     }
 
     return count;

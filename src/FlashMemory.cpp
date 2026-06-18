@@ -32,7 +32,7 @@ int FlashMemory::findLeastUsedFreeBlock() const {
     int bestBlock = -1;
     int lowestEraseCount = 999999;
 
-    for (int i = 0; i < blocks.size(); i++) {
+    for (int i = 0; i < (int)blocks.size(); i++) {
 
         if (blocks[i].getFreePageIndex() != -1) {
 
@@ -48,4 +48,51 @@ int FlashMemory::findLeastUsedFreeBlock() const {
     }
 
     return bestBlock;
+}
+
+// Finds the first free page slot in any block except excludedBlockIndex.
+// Used by GarbageCollector to migrate valid pages out of the victim block.
+PhysicalAddress FlashMemory::findFreeSlot(int excludedBlockIndex) const {
+
+    for (int i = 0; i < (int)blocks.size(); i++) {
+
+        if (i == excludedBlockIndex) continue;
+
+        int fp = blocks[i].getFreePageIndex();
+
+        if (fp != -1) {
+            PhysicalAddress addr;
+            addr.blockIndex = i;
+            addr.pageIndex  = fp;
+            return addr;
+        }
+    }
+
+    // Sentinel: no free slot found
+    PhysicalAddress none;
+    none.blockIndex = -1;
+    none.pageIndex  = -1;
+    return none;
+}
+
+int FlashMemory::getFreePageCount() const {
+
+    int count = 0;
+
+    for (int i = 0; i < (int)blocks.size(); i++) {
+        count += blocks[i].getFreePageCount();
+    }
+
+    return count;
+}
+
+int FlashMemory::getTotalPageCount() const {
+
+    int count = 0;
+
+    for (int i = 0; i < (int)blocks.size(); i++) {
+        count += blocks[i].getTotalPages();
+    }
+
+    return count;
 }

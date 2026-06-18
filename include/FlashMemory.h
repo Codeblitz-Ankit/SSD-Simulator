@@ -3,6 +3,7 @@
 
 #include <vector>
 #include "Block.h"
+#include "PhysicalAddress.h"
 
 class FlashMemory {
 private:
@@ -16,8 +17,14 @@ public:
     int getTotalBlocks() const;
 
     int findFreeBlock() const;
-
     int findLeastUsedFreeBlock() const;
+
+    // Find any free page NOT in excludedBlockIndex (used by GC for migration).
+    // Returns PhysicalAddress with blockIndex = -1 if no slot found.
+    PhysicalAddress findFreeSlot(int excludedBlockIndex) const;
+
+    int getFreePageCount()  const;
+    int getTotalPageCount() const;
 };
 
 #endif

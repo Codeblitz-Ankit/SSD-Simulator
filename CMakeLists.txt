@@ -15,4 +15,7 @@ add_executable(ssd_simulator
     src/SSDController.cpp
     src/WriteRequest.cpp
     src/RequestQueue.cpp
+    # Phase 1: GC + Stats
+    src/StatsTracker.cpp
+    src/GarbageCollector.cpp
 )

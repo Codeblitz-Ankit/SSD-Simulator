@@ -23,6 +23,13 @@ public:
     PhysicalAddress removeMapping(
         int logicalAddress
     );
+
+    // Reverse lookup: given a physical address, find the LBA that maps to it.
+    // Returns -1 if no LBA currently maps to this physical page.
+    // O(n) scan — only called from GC, so performance is acceptable.
+    int findLogicalAddress(
+        const PhysicalAddress& physAddr
+    ) const;
 };
 
 #endif

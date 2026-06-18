@@ -12,7 +12,8 @@ private:
 public:
     Block(int numPages);
 
-    Page& getPage(int index);
+    Page&       getPage(int index);
+    const Page& getPage(int index) const;
 
     int getFreePageIndex() const;
 
@@ -23,6 +24,8 @@ public:
     int getTotalPages() const;
 
     int getInvalidPageCount() const;
+    int getFreePageCount()    const;
+    int getValidPageCount()   const;
 };
 
 #endif
