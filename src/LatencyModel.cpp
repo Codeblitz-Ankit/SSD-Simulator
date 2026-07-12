@@ -4,14 +4,16 @@
 LatencyModel::LatencyModel()
     : pageReadUs(50.0),
       pageWriteUs(500.0),
-      blockEraseUs(2000.0)
+      blockEraseUs(2000.0),
+      dramReadUs(0.1)
 {}
 
 // ─── Custom constructor ───────────────────────────────────────────────────────
 LatencyModel::LatencyModel(double readUs, double writeUs, double eraseUs)
     : pageReadUs(readUs),
       pageWriteUs(writeUs),
-      blockEraseUs(eraseUs)
+      blockEraseUs(eraseUs),
+      dramReadUs(0.1)   // DRAM latency is grade-independent
 {}
 
 // ─── Named constructors ───────────────────────────────────────────────────────

@@ -24,9 +24,10 @@
 
 struct LatencyModel {
 
-    double pageReadUs;    // µs — tR:    page read latency
-    double pageWriteUs;   // µs — tPROG: page program latency
-    double blockEraseUs;  // µs — tBERS: block erase latency
+    double pageReadUs;    // µs — tR:    NAND page read latency
+    double pageWriteUs;   // µs — tPROG: NAND page program latency
+    double blockEraseUs;  // µs — tBERS: NAND block erase latency
+    double dramReadUs;    // µs — DRAM access latency (cache hit, ~100 ns)
 
     // Default constructor — SLC timings (fastest, most conservative)
     LatencyModel();

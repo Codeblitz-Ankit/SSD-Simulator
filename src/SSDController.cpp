@@ -4,21 +4,23 @@
 // ─── Constructor ──────────────────────────────────────────────────────────────
 //
 // Initialisation order MUST match declaration order in the header:
-//   flashMemory → mapper → stats → latency → gc → lowWatermarkPercent
+//   flashMemory → mapper → stats → latency → cache → gc → lowWatermarkPercent
 //
-// GarbageCollector holds const-refs to flashMemory, mapper, stats, and latency,
+// GarbageCollector holds const-refs to flashMemory, mapper, stats, latency,
 // so all four must be fully constructed before gc is initialised.
 
 SSDController::SSDController(
     int          numBlocks,
     int          pagesPerBlock,
     double       lowWatermark,
-    LatencyModel model
+    LatencyModel model,
+    int          cacheSize
 )
     : flashMemory(numBlocks, pagesPerBlock),
       mapper(),
       stats(),
       latency(model),
+      cache(cacheSize),
       gc(flashMemory, mapper, stats, latency),
       lowWatermarkPercent(lowWatermark)
 {}
@@ -29,70 +31,115 @@ void SSDController::setVerbose(bool v) {
     gc.setVerbose(v);
 }
 
-// ─── Write ────────────────────────────────────────────────────────────────────
+// ─── nandWrite (private) ──────────────────────────────────────────────────────
+//
+// Writes `data` to a free NAND page for `lba`.  Handles:
+//   • GC cycle if no free block available
+//   • Free page selection (least-used block for wear leveling)
+//   • NAND page program + physical-write + latency accounting
+//   • Old physical page invalidation (out-of-place write semantics)
+//   • FTL mapping update
+//
+// Does NOT call stats.recordLogicalWrite() — the public write() does that.
+//
+// Called from:
+//   SSDController::write()  — when cache disabled, or dirty eviction from write
+//   SSDController::read()   — dirty eviction during read-miss cache insertion
+//   SSDController::flushCache() — end-of-simulation drain
 
-void SSDController::write(
-    int logicalAddress,
-    const std::string& data
-) {
-    // 1. Count this as one logical write from the host
-    stats.recordLogicalWrite();
+void SSDController::nandWrite(int lba, const std::string& data) {
 
-    // 2. Trigger GC if free-page ratio has dropped below the watermark.
-    //    GC charges its own latency (erase + migration) into stats.
+    // Trigger GC if free-page ratio is below the watermark
     if (gc.shouldTrigger(lowWatermarkPercent)) {
         gc.runOneCycle();
     }
 
-    // 3. Find a free block (prefer lowest erase count → dynamic wear leveling)
     int freeBlock = flashMemory.findLeastUsedFreeBlock();
 
     if (freeBlock == -1) {
-        // Watermark GC wasn't enough — run one more forced cycle
+        // Watermark GC wasn't enough — force one more cycle
         std::cout << "[SSD] No free block found, forcing extra GC cycle...\n";
         gc.runOneCycle();
         freeBlock = flashMemory.findLeastUsedFreeBlock();
 
         if (freeBlock == -1) {
             std::cout << "ERROR: SSD FULL — write of LBA "
-                      << logicalAddress << " dropped.\n";
+                      << lba << " dropped.\n";
             return;
         }
     }
 
     int freePage = flashMemory.getBlock(freeBlock).getFreePageIndex();
 
-    // 4. Program the NAND page
+    // Program the NAND page
     flashMemory.getBlock(freeBlock)
                .getPage(freePage)
                .writeData(data);
 
-    // 5. Charge timing: one page program for this host write
     stats.recordPhysicalWrite();
-    stats.chargeWriteLatency(latency.pageWriteUs);   // Phase 2
+    stats.chargeWriteLatency(latency.pageWriteUs);
 
-    // 6. Invalidate the previously mapped physical page (out-of-place update)
+    // Invalidate the previously-mapped physical page (out-of-place semantics)
     PhysicalAddress newAddr;
     newAddr.blockIndex = freeBlock;
     newAddr.pageIndex  = freePage;
 
-    if (mapper.hasMapping(logicalAddress)) {
-        PhysicalAddress oldAddr = mapper.removeMapping(logicalAddress);
+    if (mapper.hasMapping(lba)) {
+        PhysicalAddress oldAddr = mapper.removeMapping(lba);
         flashMemory.getBlock(oldAddr.blockIndex)
                    .getPage(oldAddr.pageIndex)
                    .invalidate();
     }
 
-    // 7. Update FTL: LBA → new physical address
-    mapper.mapLogicalToPhysical(logicalAddress, newAddr);
+    // Update FTL: LBA → new physical address
+    mapper.mapLogicalToPhysical(lba, newAddr);
+}
+
+// ─── Write ────────────────────────────────────────────────────────────────────
+
+void SSDController::write(
+    int logicalAddress,
+    const std::string& data
+) {
+    stats.recordLogicalWrite();
+
+    if (!cache.isEnabled()) {
+        // ── No cache: direct NAND write (Phase 2 behaviour) ──────────────
+        nandWrite(logicalAddress, data);
+        return;
+    }
+
+    // ── Cache enabled ─────────────────────────────────────────────────────
+    // Try to write into cache.  Two outcomes:
+    //   (a) Cache hit (LBA already dirty in cache) → coalesced update, done.
+    //   (b) Cache miss → new dirty entry inserted; if cache was full and the
+    //       evicted entry was dirty → flush that evicted entry to NAND.
+
+    PageCache::Entry evicted;
+    bool mustFlush = cache.write(logicalAddress, data, evicted);
+
+    if (mustFlush) {
+        // Evicted dirty entry must be persisted to NAND
+        nandWrite(evicted.lba, evicted.data);
+    }
+    // Coalesced writes (case a) and non-dirty evictions: no NAND action needed.
 }
 
 // ─── Read ─────────────────────────────────────────────────────────────────────
 
 std::string SSDController::read(int logicalAddress) {
 
-    // Count host read, charge NAND read latency (Phase 2)
     stats.recordLogicalRead();
+
+    if (cache.isEnabled()) {
+        std::string cachedData;
+        if (cache.read(logicalAddress, cachedData)) {
+            // ── Cache hit: DRAM latency only ─────────────────────────────
+            stats.chargeReadLatency(latency.dramReadUs);
+            return cachedData;
+        }
+        // Cache miss: fall through to NAND
+    }
 
     if (!mapper.hasMapping(logicalAddress)) {
         return "[ERROR: LBA " + std::to_string(logicalAddress) + " not mapped]";
@@ -100,14 +147,47 @@ std::string SSDController::read(int logicalAddress) {
 
     PhysicalAddress addr = mapper.getPhysicalAddress(logicalAddress);
 
-    stats.chargeReadLatency(latency.pageReadUs);   // Phase 2
+    // NAND read: charge full page-read latency
+    stats.chargeReadLatency(latency.pageReadUs);
 
-    return flashMemory.getBlock(addr.blockIndex)
-                      .getPage(addr.pageIndex)
-                      .readData();
+    std::string data = flashMemory.getBlock(addr.blockIndex)
+                                  .getPage(addr.pageIndex)
+                                  .readData();
+
+    if (cache.isEnabled()) {
+        // Insert clean entry; a dirty eviction here (unusual but possible if
+        // cache is 100% dirty) must be flushed to NAND.
+        PageCache::Entry evicted;
+        if (cache.insert(logicalAddress, data, evicted)) {
+            nandWrite(evicted.lba, evicted.data);
+        }
+    }
+
+    return data;
 }
 
-// ─── Manual GC trigger ────────────────────────────────────────────────────────
+// ─── flushCache ───────────────────────────────────────────────────────────────
+//
+// Drains all dirty cache entries to NAND.  Call at end of simulation to ensure
+// all host-written data is persisted (mirrors a real SSD power-down flush).
+
+void SSDController::flushCache() {
+
+    if (!cache.isEnabled()) return;
+
+    std::vector<PageCache::Entry> dirty = cache.flush();
+
+    if (!dirty.empty()) {
+        std::cout << "[Cache] Flushing " << dirty.size()
+                  << " dirty entries to NAND...\n";
+    }
+
+    for (const auto& e : dirty) {
+        nandWrite(e.lba, e.data);
+    }
+}
+
+// ─── Manual GC ───────────────────────────────────────────────────────────────
 
 void SSDController::garbageCollect() {
     gc.runOneCycle();
@@ -145,4 +225,7 @@ void SSDController::displayStatus() {
 
 void SSDController::printStats() const {
     stats.printReport();
+    if (cache.isEnabled()) {
+        cache.printCacheStats();
+    }
 }

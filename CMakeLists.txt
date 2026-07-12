@@ -20,4 +20,6 @@ add_executable(ssd_simulator
     src/GarbageCollector.cpp
     # Phase 2: Latency Model
     src/LatencyModel.cpp
+    # Phase 4: DRAM Page Cache
+    src/PageCache.cpp
 )

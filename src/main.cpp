@@ -1,38 +1,46 @@
 // ============================================================
-//  SSD Simulator — Phase 2: Latency Model + IOPS
+//  SSD Simulator — Phase 4: DRAM LRU Page Cache
 // ============================================================
 //
-//  What Phase 2 adds
+//  What Phase 4 adds
 //  -----------------
-//  Every NAND operation is now time-charged using realistic latency
-//  constants drawn from Micron MT29F flash datasheets:
+//  A fixed-size DRAM page cache sits in front of NAND, implementing two
+//  key SSD firmware techniques:
 //
-//    Operation      SLC       MLC       TLC
-//    ─────────────  ───────   ───────   ───────
-//    Page read      50 µs     70 µs     100 µs
-//    Page program   500 µs    1800 µs   3000 µs
-//    Block erase    2000 µs   3500 µs   5000 µs
+//  1. Write Coalescing:
+//     If the same LBA is overwritten multiple times before the cache
+//     evicts it, only ONE physical NAND write occurs instead of N.
+//     This directly reduces WAF.
+//     Example: LBA 5 written 50× while in cache → 1 NAND write.
 //
-//  The demo runs the SAME workload against all three NAND grades and
-//  prints a side-by-side comparison showing how grade choice affects
-//  WAF, average latency, and IOPS.
+//  2. Read Caching:
+//     Subsequent reads to a cached LBA are served from DRAM (0.1 µs)
+//     instead of NAND (50 µs). 500× latency improvement per cache hit.
+//
+//  LRU eviction: least-recently-used page is evicted when cache is full.
+//    - Dirty eviction → flush to NAND (still counts as a physical write)
+//    - Clean eviction → silently discard (no NAND write)
+//
+//  Demo
+//  ----
+//  Runs an IDENTICAL workload three times:
+//    1. No cache         (cacheSize = 0)  — Phase 2 baseline
+//    2. Cache 8 pages    (cacheSize = 8)  — 12.5% of SSD capacity
+//    3. Cache 16 pages   (cacheSize = 16) — 25% of SSD capacity
+//
+//  Then prints a side-by-side comparison table showing WAF, latency,
+//  IOPS, and cache efficiency metrics.
 //
 //  Workload
 //  --------
 //  SSD geometry : 8 blocks × 8 pages = 64 pages total
-//  GC watermark : 25% free pages (= 16 pages)
+//  GC watermark : 25% free pages
 //
-//  Phase A: Write 40 unique LBAs once  (fills 62.5% of flash)
-//  Phase B: Overwrite 6 hot LBAs × 50 times each (triggers GC repeatedly)
-//  Phase C: Read all 40 LBAs sequentially (adds read latency mass)
-//
-//  Why this workload
-//  -----------------
-//  Phase A creates a mix of cold (long-lived) data spread across blocks.
-//  Phase B hammers a small hot set — each overwrite invalidates an old page.
-//  When GC fires, it must migrate the cold pages it finds alongside the
-//  hot invalids → WAF > 1.  Phase C adds a realistic read-dominant tail
-//  to model a database "write-then-read" access pattern.
+//  Phase A : Write 40 unique LBAs once each
+//  Phase B : Overwrite 6 "hot" LBAs × 50 times each
+//            (300 writes to a 6-LBA hot set — strong coalescing candidate)
+//  Phase C : Read all 40 LBAs once (measures cache read hit benefit)
+//  Flush   : Drain all dirty cache entries to NAND (simulates power-down)
 
 #include <iostream>
 #include <iomanip>
@@ -44,48 +52,52 @@
 
 // ─── Workload constants ───────────────────────────────────────────────────────
 
-static const int BLOCKS        = 8;
-static const int PAGES         = 8;   // 64 pages total
-static const double WATERMARK  = 0.25;
+static const int    BLOCKS      = 8;
+static const int    PAGES       = 8;    // 64 pages total
+static const double WATERMARK   = 0.25;
 
-static const int TOTAL_LBA     = 40;  // unique LBAs written in Phase A
-static const int HOT_LBA       = 6;   // first 6 LBAs are "hot"
-static const int HOT_WRITES    = 50;  // rewrites per hot LBA in Phase B
+static const int    TOTAL_LBA   = 40;
+static const int    HOT_LBA     = 6;    // first 6 LBAs are hot
+static const int    HOT_WRITES  = 50;   // rewrites per hot LBA
 
-// ─── Result struct ────────────────────────────────────────────────────────────
+// ─── Result ───────────────────────────────────────────────────────────────────
 
-struct WorkloadResult {
-    std::string gradeName;
+struct Result {
+    std::string label;
+    int         cacheSize;
     double      waf;
+    int         logicalWrites;
+    int         physicalWrites;
     double      avgReadLatUs;
-    double      avgWriteLatUs;   // amortized (host write + proportional GC)
+    double      avgWriteLatUs;
     double      totalSimMs;
     double      iops;
     int         gcCycles;
     int         pagesMigrated;
+    int         cacheHits;
+    int         cacheMisses;
+    int         writesCoalesced;
+    int         dirtyEvictions;
+    double      hitRatio;
 };
 
-// ─── runWorkload ─────────────────────────────────────────────────────────────
-// Runs the full Phase A + B + C workload on a fresh SSDController configured
-// with the given LatencyModel.  Returns a filled WorkloadResult.
+// ─── runWorkload ──────────────────────────────────────────────────────────────
 
-static WorkloadResult runWorkload(
-    const std::string& gradeName,
-    LatencyModel        model
-) {
-    std::cout << "  Running " << gradeName << " workload... ";
+static Result runWorkload(const std::string& label, int cacheSize) {
+
+    std::cout << "  [" << label << "] Running... ";
     std::cout.flush();
 
-    // Fresh SSD for each grade — GC output suppressed for clean comparison
-    SSDController ssd(BLOCKS, PAGES, WATERMARK, model);
+    SSDController ssd(BLOCKS, PAGES, WATERMARK,
+                      LatencyModel::SLC(), cacheSize);
     ssd.setVerbose(false);
 
-    // ── Phase A: write all TOTAL_LBA addresses once ───────────────────────
+    // ── Phase A: fill SSD with 40 unique LBAs ────────────────────────────
     for (int i = 0; i < TOTAL_LBA; i++) {
         ssd.write(i * 10, "cold_LBA" + std::to_string(i * 10));
     }
 
-    // ── Phase B: hammer the HOT_LBA hot addresses ─────────────────────────
+    // ── Phase B: hammer 6 hot LBAs ───────────────────────────────────────
     for (int w = 0; w < HOT_WRITES; w++) {
         for (int i = 0; i < HOT_LBA; i++) {
             ssd.write(i * 10,
@@ -99,176 +111,249 @@ static WorkloadResult runWorkload(
         ssd.read(i * 10);
     }
 
+    // ── Flush: drain dirty cache entries to NAND ──────────────────────────
+    ssd.flushCache();
+
     std::cout << "done.\n";
 
-    // ── Extract results ───────────────────────────────────────────────────
+    // ── Collect results ───────────────────────────────────────────────────
     const StatsTracker& st = ssd.getStats();
+    const PageCache&    pc = ssd.getCache();
 
-    WorkloadResult r;
-    r.gradeName     = gradeName;
-    r.waf           = st.getWAF();
-    r.avgReadLatUs  = st.getAvgReadLatencyUs();
-    r.avgWriteLatUs = st.getAvgWriteLatencyUs();
-    r.totalSimMs    = st.getTotalSimulatedTimeUs() / 1000.0;
-    r.iops          = st.getIOPS();
-    r.gcCycles      = st.getGCInvocations();
-    r.pagesMigrated = st.getPagesMigrated();
+    Result r;
+    r.label           = label;
+    r.cacheSize       = cacheSize;
+    r.waf             = st.getWAF();
+    r.logicalWrites   = st.getLogicalWrites();
+    r.physicalWrites  = st.getPhysicalWrites();
+    r.avgReadLatUs    = st.getAvgReadLatencyUs();
+    r.avgWriteLatUs   = st.getAvgWriteLatencyUs();
+    r.totalSimMs      = st.getTotalSimulatedTimeUs() / 1000.0;
+    r.iops            = st.getIOPS();
+    r.gcCycles        = st.getGCInvocations();
+    r.pagesMigrated   = st.getPagesMigrated();
+    r.cacheHits       = pc.getCacheHits();
+    r.cacheMisses     = pc.getCacheMisses();
+    r.writesCoalesced = pc.getWritesCoalesced();
+    r.dirtyEvictions  = pc.getDirtyEvictions();
+    r.hitRatio        = pc.getHitRatio();
 
     return r;
 }
 
 // ─── printTable ──────────────────────────────────────────────────────────────
 
-static void printTable(const std::vector<WorkloadResult>& results) {
+static void printTable(const std::vector<Result>& results) {
 
-    // Column widths
-    const int W0 = 26;   // metric label
-    const int W  = 16;   // data column
+    const int L = 27;    // label column width
+    const int C = 16;    // data column width
 
     auto hline = [&]() {
-        std::cout << "  +" << std::string(W0, '-');
+        std::cout << "  +" << std::string(L, '-');
         for (size_t i = 0; i < results.size(); i++)
-            std::cout << "+" << std::string(W, '-');
+            std::cout << "+" << std::string(C, '-');
         std::cout << "+\n";
     };
 
     auto row = [&](const std::string& label,
                    const std::vector<std::string>& vals) {
-        std::cout << "  | " << std::left << std::setw(W0 - 1) << label;
+        std::cout << "  | " << std::left << std::setw(L - 1) << label;
         for (const auto& v : vals)
-            std::cout << "| " << std::right << std::setw(W - 2) << v << " ";
+            std::cout << "| " << std::right << std::setw(C - 2) << v << " ";
         std::cout << "|\n";
     };
 
+    // ── Header ───────────────────────────────────────────────────────────
     std::cout << "\n";
     hline();
-
-    // Header
-    std::vector<std::string> headers;
-    for (const auto& r : results) headers.push_back(r.gradeName);
-    row("Metric", headers);
+    {
+        std::vector<std::string> hdrs;
+        for (const auto& r : results) hdrs.push_back(r.label);
+        row("Metric", hdrs);
+    }
     hline();
 
-    // WAF
+    auto fmt = [](double v, int prec, const std::string& suffix = "") {
+        std::ostringstream o;
+        o << std::fixed << std::setprecision(prec) << v << suffix;
+        return o.str();
+    };
+
+    // ── WAF ───────────────────────────────────────────────────────────────
     {
-        std::vector<std::string> vals;
-        for (const auto& r : results) {
-            std::ostringstream oss;
-            oss << std::fixed << std::setprecision(2) << r.waf << "x";
-            vals.push_back(oss.str());
-        }
-        row("WAF", vals);
+        std::vector<std::string> v;
+        for (const auto& r : results) v.push_back(fmt(r.waf, 2, "x"));
+        row("WAF", v);
     }
 
-    // Avg Read Latency
+    // ── Physical writes ───────────────────────────────────────────────────
     {
-        std::vector<std::string> vals;
-        for (const auto& r : results) {
-            std::ostringstream oss;
-            oss << std::fixed << std::setprecision(1) << r.avgReadLatUs << " µs";
-            vals.push_back(oss.str());
-        }
-        row("Avg Read Latency", vals);
+        std::vector<std::string> v;
+        for (const auto& r : results)
+            v.push_back(std::to_string(r.physicalWrites)
+                        + " / " + std::to_string(r.logicalWrites));
+        row("Phys / Logic Writes", v);
     }
 
-    // Avg Write Latency (amortized)
+    // ── Avg Read Latency ─────────────────────────────────────────────────
     {
-        std::vector<std::string> vals;
-        for (const auto& r : results) {
-            std::ostringstream oss;
-            oss << std::fixed << std::setprecision(1) << r.avgWriteLatUs << " µs";
-            vals.push_back(oss.str());
-        }
-        row("Avg Write Lat (w/GC)", vals);
+        std::vector<std::string> v;
+        for (const auto& r : results) v.push_back(fmt(r.avgReadLatUs,  1, " µs"));
+        row("Avg Read Latency", v);
     }
 
-    // Total Simulated Time
+    // ── Avg Write Latency ─────────────────────────────────────────────────
     {
-        std::vector<std::string> vals;
-        for (const auto& r : results) {
-            std::ostringstream oss;
-            oss << std::fixed << std::setprecision(2) << r.totalSimMs << " ms";
-            vals.push_back(oss.str());
-        }
-        row("Total Simulated Time", vals);
+        std::vector<std::string> v;
+        for (const auto& r : results) v.push_back(fmt(r.avgWriteLatUs, 1, " µs"));
+        row("Avg Write Lat (w/GC)", v);
     }
 
-    // IOPS
+    // ── Total Simulated Time ──────────────────────────────────────────────
     {
-        std::vector<std::string> vals;
-        for (const auto& r : results) {
-            std::ostringstream oss;
-            oss << std::fixed << std::setprecision(0) << r.iops;
-            vals.push_back(oss.str());
-        }
-        row("Estimated IOPS", vals);
+        std::vector<std::string> v;
+        for (const auto& r : results) v.push_back(fmt(r.totalSimMs, 2, " ms"));
+        row("Total Simulated Time", v);
+    }
+
+    // ── IOPS ──────────────────────────────────────────────────────────────
+    {
+        std::vector<std::string> v;
+        for (const auto& r : results) v.push_back(fmt(r.iops, 0));
+        row("Estimated IOPS", v);
     }
 
     hline();
 
-    // GC Cycles
+    // ── GC / Wear ─────────────────────────────────────────────────────────
     {
-        std::vector<std::string> vals;
-        for (const auto& r : results) {
-            vals.push_back(std::to_string(r.gcCycles));
-        }
-        row("GC Cycles", vals);
+        std::vector<std::string> v;
+        for (const auto& r : results) v.push_back(std::to_string(r.gcCycles));
+        row("GC Cycles", v);
+    }
+    {
+        std::vector<std::string> v;
+        for (const auto& r : results) v.push_back(std::to_string(r.pagesMigrated));
+        row("Pages Migrated", v);
     }
 
-    // Pages Migrated
+    hline();
+
+    // ── Cache stats (only if cache was enabled) ────────────────────────────
     {
-        std::vector<std::string> vals;
-        for (const auto& r : results) {
-            vals.push_back(std::to_string(r.pagesMigrated));
-        }
-        row("Pages Migrated", vals);
+        std::vector<std::string> v;
+        for (const auto& r : results)
+            v.push_back(r.cacheSize > 0 ? fmt(r.hitRatio, 1, "%") : "N/A");
+        row("Cache Hit Ratio", v);
+    }
+    {
+        std::vector<std::string> v;
+        for (const auto& r : results)
+            v.push_back(r.cacheSize > 0
+                        ? std::to_string(r.writesCoalesced)
+                        : "N/A");
+        row("Writes Coalesced", v);
+    }
+    {
+        std::vector<std::string> v;
+        for (const auto& r : results)
+            v.push_back(r.cacheSize > 0
+                        ? std::to_string(r.dirtyEvictions)
+                        : "N/A");
+        row("Dirty Evictions", v);
     }
 
     hline();
     std::cout << "\n";
 }
 
-// ─── printInsights ───────────────────────────────────────────────────────────
+// ─── printInsights ────────────────────────────────────────────────────────────
 
-static void printInsights(const std::vector<WorkloadResult>& results) {
+static void printInsights(const std::vector<Result>& results) {
 
     if (results.size() < 2) return;
 
-    const WorkloadResult& slc = results[0];   // baseline
-    const WorkloadResult& tlc = results[2];   // worst
+    const Result& base  = results[0];  // no-cache baseline
+    const Result& cache8 = results[1]; // cache-8
 
-    std::cout << "  Key Takeaways\n";
+    std::cout << "  Key Takeaways (No-Cache vs Cache-8)\n";
     std::cout << "  ─────────────────────────────────────────────────────\n";
 
-    // WAF is grade-independent
-    std::cout << "  • WAF is identical across all grades (" 
-              << std::fixed << std::setprecision(2) << slc.waf
-              << "x) — WAF is determined by\n"
-              << "    workload access pattern + GC algorithm, NOT NAND timing.\n\n";
+    // WAF reduction
+    double wafReduction = (base.waf - cache8.waf) / base.waf * 100.0;
+    std::cout << "  • WAF reduced " << std::fixed << std::setprecision(1)
+              << wafReduction << "% by write coalescing: "
+              << std::setprecision(2) << base.waf << "x → "
+              << cache8.waf << "x\n"
+              << "    " << cache8.writesCoalesced
+              << " writes absorbed by cache before eviction.\n\n";
 
-    // Write latency amplification
-    double wlatRatio = tlc.avgWriteLatUs / slc.avgWriteLatUs;
-    std::cout << "  • Write latency: TLC is "
-              << std::fixed << std::setprecision(1) << wlatRatio
-              << "x slower than SLC (per host write, amortized GC).\n"
-              << "    SLC: " << std::setprecision(0) << slc.avgWriteLatUs
-              << " µs  →  TLC: " << tlc.avgWriteLatUs << " µs\n\n";
+    // Physical write reduction
+    int writeReduction = base.physicalWrites - cache8.physicalWrites;
+    std::cout << "  • Physical NAND writes cut from "
+              << base.physicalWrites << " → " << cache8.physicalWrites
+              << " (" << writeReduction << " writes saved).\n\n";
 
-    // IOPS ratio
-    double iopsRatio = slc.iops / tlc.iops;
-    std::cout << "  • IOPS: SLC delivers "
-              << std::fixed << std::setprecision(1) << iopsRatio
-              << "x more IOPS than TLC under the same workload.\n"
-              << "    SLC: " << std::setprecision(0) << slc.iops
-              << " IOPS  →  TLC: " << tlc.iops << " IOPS\n\n";
+    // Read latency
+    double readSpeedup = base.avgReadLatUs / cache8.avgReadLatUs;
+    std::cout << "  • Avg read latency " << std::setprecision(1)
+              << readSpeedup << "x faster with cache: "
+              << base.avgReadLatUs << " µs → " << cache8.avgReadLatUs << " µs\n"
+              << "    (cache hit ratio " << cache8.hitRatio << "% — mostly DRAM "
+              << "0.1 µs vs NAND 50 µs)\n\n";
 
-    // GC overhead contribution
-    std::cout << "  • The GC write amplification factor (" 
-              << std::fixed << std::setprecision(2) << slc.waf
-              << "x) means every host write\n"
-              << "    causes " << std::setprecision(2) << (slc.waf - 1.0)
-              << " extra NAND programs on average (migration overhead).\n";
+    // IOPS improvement
+    double iopsImprovement = cache8.iops / base.iops;
+    std::cout << "  • IOPS " << std::setprecision(1) << iopsImprovement
+              << "x higher with cache: "
+              << std::setprecision(0) << base.iops << " → "
+              << cache8.iops << "\n\n";
+
+    // GC reduction
+    std::cout << "  • GC cycles: " << base.gcCycles << " (no cache) → "
+              << cache8.gcCycles << " (cache-8)\n"
+              << "    Fewer NAND writes = less space pressure = fewer GC cycles.\n";
     std::cout << "  ─────────────────────────────────────────────────────\n\n";
+}
+
+// ─── verboseRun ──────────────────────────────────────────────────────────────
+// Runs one workload with GC verbose ON and prints per-LBA read verification
+// + full stats report.  Used to show the detailed SLC + cache-8 picture.
+
+static void verboseRun(int cacheSize) {
+
+    std::cout << "============================================================\n";
+    std::cout << "  Detailed Run — SLC + Cache-" << cacheSize << " (verbose GC)\n";
+    std::cout << "============================================================\n\n";
+
+    SSDController ssd(BLOCKS, PAGES, WATERMARK,
+                      LatencyModel::SLC(), cacheSize);
+    ssd.setVerbose(true);
+
+    std::cout << "--- Phase A: Initial writes (GC output suppressed) ---\n";
+    ssd.setVerbose(false);
+    for (int i = 0; i < TOTAL_LBA; i++)
+        ssd.write(i * 10, "cold_LBA" + std::to_string(i * 10));
+    ssd.setVerbose(true);
+
+    std::cout << "\n--- Phase B: Hot LBA rewrites ---\n";
+    for (int w = 0; w < HOT_WRITES; w++)
+        for (int i = 0; i < HOT_LBA; i++)
+            ssd.write(i * 10,
+                      "hot_v" + std::to_string(w)
+                      + "_LBA" + std::to_string(i * 10));
+
+    ssd.flushCache();
+
+    std::cout << "\n--- Phase C: Final reads ---\n";
+    for (int i = 0; i < TOTAL_LBA; i++) {
+        std::string val = ssd.read(i * 10);
+        std::cout << "  LBA " << std::setw(3) << (i * 10)
+                  << " -> \"" << val << "\"\n";
+    }
+
+    ssd.displayStatus();
+    ssd.printStats();
 }
 
 // ─── main ────────────────────────────────────────────────────────────────────
@@ -276,59 +361,38 @@ static void printInsights(const std::vector<WorkloadResult>& results) {
 int main() {
 
     std::cout << "============================================================\n";
-    std::cout << "  SSD Simulator — Phase 2: Latency Model + IOPS\n";
+    std::cout << "  SSD Simulator — Phase 4: DRAM LRU Page Cache\n";
     std::cout << "============================================================\n";
-    std::cout << "  Geometry : " << BLOCKS << " blocks x " << PAGES
+    std::cout << "  NAND Grade : SLC  (50 µs read / 500 µs write / 2 ms erase)\n";
+    std::cout << "  DRAM Lat.  : 0.1 µs  (cache hit)\n";
+    std::cout << "  Geometry   : " << BLOCKS << " blocks x " << PAGES
               << " pages = " << (BLOCKS * PAGES) << " pages total\n";
-    std::cout << "  Watermark: " << (WATERMARK * 100) << "% free\n";
-    std::cout << "  Phase A  : " << TOTAL_LBA << " unique LBA writes\n";
-    std::cout << "  Phase B  : " << HOT_LBA << " hot LBAs x "
+    std::cout << "  Watermark  : " << (WATERMARK * 100.0) << "% free\n";
+    std::cout << "  Phase A    : " << TOTAL_LBA << " unique LBA writes\n";
+    std::cout << "  Phase B    : " << HOT_LBA << " hot LBAs x "
               << HOT_WRITES << " rewrites\n";
-    std::cout << "  Phase C  : " << TOTAL_LBA << " sequential reads\n";
+    std::cout << "  Phase C    : " << TOTAL_LBA << " sequential reads\n";
+    std::cout << "  Flush      : drain dirty cache entries to NAND\n";
     std::cout << "============================================================\n\n";
 
-    std::cout << "Running workload on all NAND grades:\n";
+    // ── Comparison runs ───────────────────────────────────────────────────
+    std::cout << "Running workload comparison:\n";
 
-    std::vector<WorkloadResult> results;
-    results.push_back(runWorkload("SLC", LatencyModel::SLC()));
-    results.push_back(runWorkload("MLC", LatencyModel::MLC()));
-    results.push_back(runWorkload("TLC", LatencyModel::TLC()));
+    std::vector<Result> results;
+    results.push_back(runWorkload("No Cache",  0));
+    results.push_back(runWorkload("Cache-8",   8));
+    results.push_back(runWorkload("Cache-16", 16));
 
+    // ── Comparison table ──────────────────────────────────────────────────
     std::cout << "\n============================================================\n";
-    std::cout << "  NAND Grade Comparison\n";
+    std::cout << "  Cache Size Comparison\n";
     std::cout << "============================================================\n";
 
     printTable(results);
     printInsights(results);
 
-    // ── Detailed stats for SLC (verbose Phase 1 + 2 combined report) ──────
-    std::cout << "============================================================\n";
-    std::cout << "  Detailed Report — SLC (verbose GC enabled)\n";
-    std::cout << "============================================================\n\n";
-
-    SSDController ssdVerbose(BLOCKS, PAGES, WATERMARK, LatencyModel::SLC());
-    ssdVerbose.setVerbose(true);
-
-    std::cout << "--- Phase A: Initial writes ---\n";
-    for (int i = 0; i < TOTAL_LBA; i++)
-        ssdVerbose.write(i * 10, "cold_LBA" + std::to_string(i * 10));
-
-    std::cout << "\n--- Phase B: Hot LBA rewrites ---\n";
-    for (int w = 0; w < HOT_WRITES; w++)
-        for (int i = 0; i < HOT_LBA; i++)
-            ssdVerbose.write(i * 10,
-                             "hot_v" + std::to_string(w)
-                             + "_LBA" + std::to_string(i * 10));
-
-    std::cout << "\n--- Phase C: Read all LBAs ---\n";
-    for (int i = 0; i < TOTAL_LBA; i++) {
-        std::string val = ssdVerbose.read(i * 10);
-        std::cout << "  LBA " << std::setw(3) << (i * 10)
-                  << " -> \"" << val << "\"\n";
-    }
-
-    ssdVerbose.displayStatus();
-    ssdVerbose.printStats();
+    // ── Detailed verbose run: SLC + cache-8 ──────────────────────────────
+    verboseRun(8);
 
     return 0;
 }
