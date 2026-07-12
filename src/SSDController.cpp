@@ -1,22 +1,21 @@
 #include "SSDController.h"
 #include <iostream>
+#include <iomanip>
+#include <cmath>    // sqrt for std-dev display
+#include <string>
+#include <climits>
 
 // ─── Constructor ──────────────────────────────────────────────────────────────
-//
-// Initialisation order MUST match declaration order in the header:
-//   flashMemory → mapper → stats → latency → cache → gc → lowWatermarkPercent
-//
-// GarbageCollector holds const-refs to flashMemory, mapper, stats, latency,
-// so all four must be fully constructed before gc is initialised.
 
 SSDController::SSDController(
     int          numBlocks,
     int          pagesPerBlock,
     double       lowWatermark,
     LatencyModel model,
-    int          cacheSize
+    int          cacheSize,
+    int          peLimit
 )
-    : flashMemory(numBlocks, pagesPerBlock),
+    : flashMemory(numBlocks, pagesPerBlock, peLimit),
       mapper(),
       stats(),
       latency(model),
@@ -25,31 +24,20 @@ SSDController::SSDController(
       lowWatermarkPercent(lowWatermark)
 {}
 
-// ─── setVerbose ───────────────────────────────────────────────────────────────
+// ─── Configuration ────────────────────────────────────────────────────────────
 
 void SSDController::setVerbose(bool v) {
     gc.setVerbose(v);
 }
 
+void SSDController::setWearLevelInterval(int n) {
+    gc.setWearLevelInterval(n);
+}
+
 // ─── nandWrite (private) ──────────────────────────────────────────────────────
-//
-// Writes `data` to a free NAND page for `lba`.  Handles:
-//   • GC cycle if no free block available
-//   • Free page selection (least-used block for wear leveling)
-//   • NAND page program + physical-write + latency accounting
-//   • Old physical page invalidation (out-of-place write semantics)
-//   • FTL mapping update
-//
-// Does NOT call stats.recordLogicalWrite() — the public write() does that.
-//
-// Called from:
-//   SSDController::write()  — when cache disabled, or dirty eviction from write
-//   SSDController::read()   — dirty eviction during read-miss cache insertion
-//   SSDController::flushCache() — end-of-simulation drain
 
 void SSDController::nandWrite(int lba, const std::string& data) {
 
-    // Trigger GC if free-page ratio is below the watermark
     if (gc.shouldTrigger(lowWatermarkPercent)) {
         gc.runOneCycle();
     }
@@ -57,21 +45,18 @@ void SSDController::nandWrite(int lba, const std::string& data) {
     int freeBlock = flashMemory.findLeastUsedFreeBlock();
 
     if (freeBlock == -1) {
-        // Watermark GC wasn't enough — force one more cycle
-        std::cout << "[SSD] No free block found, forcing extra GC cycle...\n";
+        std::cout << "[SSD] No free block — forcing extra GC cycle...\n";
         gc.runOneCycle();
         freeBlock = flashMemory.findLeastUsedFreeBlock();
 
         if (freeBlock == -1) {
-            std::cout << "ERROR: SSD FULL — write of LBA "
-                      << lba << " dropped.\n";
+            std::cout << "ERROR: SSD FULL — write of LBA " << lba << " dropped.\n";
             return;
         }
     }
 
     int freePage = flashMemory.getBlock(freeBlock).getFreePageIndex();
 
-    // Program the NAND page
     flashMemory.getBlock(freeBlock)
                .getPage(freePage)
                .writeData(data);
@@ -79,7 +64,6 @@ void SSDController::nandWrite(int lba, const std::string& data) {
     stats.recordPhysicalWrite();
     stats.chargeWriteLatency(latency.pageWriteUs);
 
-    // Invalidate the previously-mapped physical page (out-of-place semantics)
     PhysicalAddress newAddr;
     newAddr.blockIndex = freeBlock;
     newAddr.pageIndex  = freePage;
@@ -91,38 +75,24 @@ void SSDController::nandWrite(int lba, const std::string& data) {
                    .invalidate();
     }
 
-    // Update FTL: LBA → new physical address
     mapper.mapLogicalToPhysical(lba, newAddr);
 }
 
 // ─── Write ────────────────────────────────────────────────────────────────────
 
-void SSDController::write(
-    int logicalAddress,
-    const std::string& data
-) {
+void SSDController::write(int logicalAddress, const std::string& data) {
+
     stats.recordLogicalWrite();
 
     if (!cache.isEnabled()) {
-        // ── No cache: direct NAND write (Phase 2 behaviour) ──────────────
         nandWrite(logicalAddress, data);
         return;
     }
 
-    // ── Cache enabled ─────────────────────────────────────────────────────
-    // Try to write into cache.  Two outcomes:
-    //   (a) Cache hit (LBA already dirty in cache) → coalesced update, done.
-    //   (b) Cache miss → new dirty entry inserted; if cache was full and the
-    //       evicted entry was dirty → flush that evicted entry to NAND.
-
     PageCache::Entry evicted;
-    bool mustFlush = cache.write(logicalAddress, data, evicted);
-
-    if (mustFlush) {
-        // Evicted dirty entry must be persisted to NAND
+    if (cache.write(logicalAddress, data, evicted)) {
         nandWrite(evicted.lba, evicted.data);
     }
-    // Coalesced writes (case a) and non-dirty evictions: no NAND action needed.
 }
 
 // ─── Read ─────────────────────────────────────────────────────────────────────
@@ -134,11 +104,9 @@ std::string SSDController::read(int logicalAddress) {
     if (cache.isEnabled()) {
         std::string cachedData;
         if (cache.read(logicalAddress, cachedData)) {
-            // ── Cache hit: DRAM latency only ─────────────────────────────
             stats.chargeReadLatency(latency.dramReadUs);
             return cachedData;
         }
-        // Cache miss: fall through to NAND
     }
 
     if (!mapper.hasMapping(logicalAddress)) {
@@ -146,8 +114,6 @@ std::string SSDController::read(int logicalAddress) {
     }
 
     PhysicalAddress addr = mapper.getPhysicalAddress(logicalAddress);
-
-    // NAND read: charge full page-read latency
     stats.chargeReadLatency(latency.pageReadUs);
 
     std::string data = flashMemory.getBlock(addr.blockIndex)
@@ -155,8 +121,6 @@ std::string SSDController::read(int logicalAddress) {
                                   .readData();
 
     if (cache.isEnabled()) {
-        // Insert clean entry; a dirty eviction here (unusual but possible if
-        // cache is 100% dirty) must be flushed to NAND.
         PageCache::Entry evicted;
         if (cache.insert(logicalAddress, data, evicted)) {
             nandWrite(evicted.lba, evicted.data);
@@ -167,21 +131,16 @@ std::string SSDController::read(int logicalAddress) {
 }
 
 // ─── flushCache ───────────────────────────────────────────────────────────────
-//
-// Drains all dirty cache entries to NAND.  Call at end of simulation to ensure
-// all host-written data is persisted (mirrors a real SSD power-down flush).
 
 void SSDController::flushCache() {
 
     if (!cache.isEnabled()) return;
 
-    std::vector<PageCache::Entry> dirty = cache.flush();
-
+    auto dirty = cache.flush();
     if (!dirty.empty()) {
         std::cout << "[Cache] Flushing " << dirty.size()
                   << " dirty entries to NAND...\n";
     }
-
     for (const auto& e : dirty) {
         nandWrite(e.lba, e.data);
     }
@@ -200,25 +159,101 @@ void SSDController::displayStatus() {
     std::cout << "\n===== SSD BLOCK STATUS =====\n";
 
     for (int i = 0; i < flashMemory.getTotalBlocks(); i++) {
-
         Block& block = flashMemory.getBlock(i);
-
-        std::cout << "  Block " << i
+        std::cout << "  Block " << std::setw(2) << i
                   << " | Free: "    << block.getFreePageCount()
                   << " | Valid: "   << block.getValidPageCount()
                   << " | Invalid: " << block.getInvalidPageCount()
                   << " | Erases: "  << block.getEraseCount()
+                  << (block.isWornOut() ? "  *** WORN OUT ***" : "")
                   << "\n";
     }
 
     int total = flashMemory.getTotalPageCount();
     int free  = flashMemory.getFreePageCount();
-
-    std::cout << "  ─────────────────────────────────────\n";
-    std::cout << "  Total pages : " << total
-              << "  |  Free: "      << free
-              << "  |  Used: "      << (total - free) << "\n";
+    std::cout << "  ─────────────────────────────────────────\n";
+    std::cout << "  Total pages: " << total
+              << "  |  Free: "     << free
+              << "  |  Used: "     << (total - free) << "\n";
     std::cout << "============================\n";
+}
+
+// ─── displayWearAnalysis ──────────────────────────────────────────────────────
+//
+// Phase 3: Prints an ASCII erase-count bar chart for every block, plus
+// statistical summary (mean, variance, min, max) and a lifespan estimate.
+
+void SSDController::displayWearAnalysis() const {
+
+    const int peLimit  = flashMemory.getPELimit();
+    const int nBlocks  = flashMemory.getTotalBlocks();
+    const int maxErase = flashMemory.getMaxEraseCount();
+    const int minErase = flashMemory.getMinEraseCount();
+    const int wornOut  = flashMemory.getWornOutCount();
+    const double avgE  = flashMemory.getAvgEraseCount();
+    const double varE  = flashMemory.getEraseCountVariance();
+    const double stdE  = std::sqrt(varE);
+
+    const int BAR_WIDTH = 40;  // max bar length in characters
+
+    std::cout << "\n";
+    std::cout << "========================================================\n";
+    std::cout << "               WEAR LEVEL ANALYSIS\n";
+    std::cout << "========================================================\n";
+    std::cout << "  P/E Limit : " << peLimit << " cycles"
+              << "   |  Worn Out: " << wornOut << " / " << nBlocks << " blocks\n";
+    std::cout << std::fixed << std::setprecision(1);
+    std::cout << "  Mean      : " << avgE
+              << "   |  Std Dev : " << stdE
+              << "   |  Variance: " << std::setprecision(2) << varE << "\n";
+    std::cout << "  Min       : " << minErase
+              << "   |  Max     : " << maxErase
+              << "   |  Spread  : " << (maxErase - minErase) << " cycles\n";
+    std::cout << "  ──────────────────────────────────────────────────────\n";
+    std::cout << "  Block | Erases |  Wear% |  Bar\n";
+    std::cout << "  ──────+--------+--------+"
+              << std::string(BAR_WIDTH + 1, '-') << "\n";
+
+    for (int i = 0; i < nBlocks; i++) {
+        const Block& b  = flashMemory.getBlock(i);
+        int          ec = b.getEraseCount();
+        double       wr = b.getWearRatio() * 100.0;
+
+        // Normalise bar length relative to peLimit (not maxErase) so the
+        // full bar width always represents "fully worn out".
+        int barLen = (peLimit > 0)
+                     ? static_cast<int>((double)ec / peLimit * BAR_WIDTH)
+                     : 0;
+        barLen = std::min(barLen, BAR_WIDTH);
+
+        char barChar = b.isWornOut() ? 'X' : '|';
+
+        std::cout << "  " << std::setw(5) << i
+                  << " | " << std::setw(6) << ec
+                  << " | " << std::setw(5) << std::fixed
+                  << std::setprecision(1) << wr << "% |"
+                  << std::string(barLen, barChar)
+                  << (b.isWornOut() ? " WORN" : "")
+                  << "\n";
+    }
+
+    std::cout << "  ──────────────────────────────────────────────────────\n";
+
+    // ── Lifespan estimate ─────────────────────────────────────────────────
+
+    long long rem = stats.estimateRemainingWrites(
+        peLimit, maxErase, flashMemory.getTotalPageCount());
+
+    std::cout << "  Lifespan estimate (conservative — worst block):\n";
+    if (rem == LLONG_MAX) {
+        std::cout << "  → No writes recorded yet — cannot estimate.\n";
+    } else if (rem == 0) {
+        std::cout << "  → *** WORN OUT — most-worn block at P/E limit! ***\n";
+    } else {
+        std::cout << "  → ~" << rem << " more host writes before first block"
+                  << " reaches P/E limit (" << peLimit << ").\n";
+    }
+    std::cout << "========================================================\n\n";
 }
 
 // ─── printStats ───────────────────────────────────────────────────────────────

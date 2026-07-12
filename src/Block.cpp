@@ -1,8 +1,9 @@
 #include "Block.h"
 
-Block::Block(int numPages) {
-    eraseCount = 0;
-
+Block::Block(int numPages, int peLimit)
+    : eraseCount(0),
+      peLimit(peLimit)
+{
     for (int i = 0; i < numPages; i++) {
         pages.push_back(Page());
     }
@@ -30,6 +31,19 @@ int Block::getFreePageIndex() const {
 
 int Block::getEraseCount() const {
     return eraseCount;
+}
+
+int Block::getPELimit() const {
+    return peLimit;
+}
+
+bool Block::isWornOut() const {
+    return eraseCount >= peLimit;
+}
+
+double Block::getWearRatio() const {
+    if (peLimit <= 0) return 1.0;
+    return static_cast<double>(eraseCount) / peLimit;
 }
 
 void Block::eraseBlock() {

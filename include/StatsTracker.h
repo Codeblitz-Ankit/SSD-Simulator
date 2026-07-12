@@ -38,6 +38,9 @@ private:
     double totalWriteLatencyUs;  // host write NAND programs only
     double totalGCLatencyUs;     // GC erase ops + GC migration writes
 
+    // ── Phase 3 ───────────────────────────────────────────────────────────
+    int    staticWearLevelCount;
+
 public:
     StatsTracker();
 
@@ -57,6 +60,9 @@ public:
     void chargeWriteLatency(double us);   // host writes only
     void chargeGCLatency   (double us);   // GC page-program + block-erase
 
+    // ── Phase 3 recording ─────────────────────────────────────────────────
+    void recordStaticWearLevel();
+
     // ── Phase 1 getters ───────────────────────────────────────────────────
     double getWAF()           const;
     int    getGCInvocations() const;
@@ -64,6 +70,7 @@ public:
     int    getLogicalWrites() const;
     int    getPhysicalWrites()const;
     int    getLogicalReads()  const;
+    int    getStaticWearLevelCount() const;
 
     // ── Phase 2 getters ───────────────────────────────────────────────────
 
@@ -80,6 +87,22 @@ public:
 
     // Estimated host IOPS = (reads + writes) / totalSimulatedTime[s]
     double getIOPS() const;
+
+    // ── Phase 3: Lifespan estimation ──────────────────────────────────────
+    //
+    // Conservative estimate of remaining HOST writes before the most-worn
+    // block hits its P/E cycle limit.
+    //
+    // Formula: hostRemaining = (peLimit - maxEraseNow) × totalPages / WAF
+    //   (peLimit - maxEraseNow) = remaining erases for the worst block
+    //   totalPages / WAF        = host writes consumed per erase cycle on avg
+    //
+    // Returns LLONG_MAX when no writes have been made yet (WAF = 0).
+    long long estimateRemainingWrites(
+        int peLimit,
+        int maxEraseNow,
+        int totalPages
+    ) const;
 
     // ── Report ────────────────────────────────────────────────────────────
     void printReport() const;

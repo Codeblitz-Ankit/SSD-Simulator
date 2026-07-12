@@ -1,6 +1,8 @@
 #include "StatsTracker.h"
 #include <iostream>
 #include <iomanip>
+#include <climits>
+#include <algorithm>  // std::max
 
 // ─── Constructor ──────────────────────────────────────────────────────────────
 
@@ -12,7 +14,8 @@ StatsTracker::StatsTracker()
       logicalReadCount(0),
       totalReadLatencyUs(0.0),
       totalWriteLatencyUs(0.0),
-      totalGCLatencyUs(0.0)
+      totalGCLatencyUs(0.0),
+      staticWearLevelCount(0)  // Phase 3
 {}
 
 // ─── Phase 1 recording ────────────────────────────────────────────────────────
@@ -52,6 +55,12 @@ void StatsTracker::chargeGCLatency(double us) {
     totalGCLatencyUs += us;
 }
 
+// ─── Phase 3 recording ───────────────────────────────────────────────────────
+
+void StatsTracker::recordStaticWearLevel() {
+    staticWearLevelCount++;
+}
+
 // ─── Phase 1 getters ─────────────────────────────────────────────────────────
 
 double StatsTracker::getWAF() const {
@@ -64,6 +73,7 @@ int StatsTracker::getPagesMigrated()  const { return pagesMigrated; }
 int StatsTracker::getLogicalWrites()  const { return logicalWriteCount; }
 int StatsTracker::getPhysicalWrites() const { return physicalWriteCount; }
 int StatsTracker::getLogicalReads()   const { return logicalReadCount; }
+int StatsTracker::getStaticWearLevelCount() const { return staticWearLevelCount; }  // Phase 3
 
 // ─── Phase 2 getters ─────────────────────────────────────────────────────────
 
@@ -88,7 +98,25 @@ double StatsTracker::getIOPS() const {
     double totalTimeUs = getTotalSimulatedTimeUs();
     if (totalTimeUs <= 0.0) return 0.0;
     double totalOps = static_cast<double>(logicalReadCount + logicalWriteCount);
-    return (totalOps / totalTimeUs) * 1.0e6;   // ops/µs → ops/s
+    return (totalOps / totalTimeUs) * 1.0e6;
+}
+
+// ─── Phase 3: Lifespan estimation ────────────────────────────────────────────
+
+long long StatsTracker::estimateRemainingWrites(
+    int peLimit,
+    int maxEraseNow,
+    int totalPages
+) const {
+    double waf = getWAF();
+    if (waf <= 0.0 || logicalWriteCount == 0) return LLONG_MAX;
+
+    int remaining = peLimit - maxEraseNow;
+    if (remaining <= 0) return 0LL;
+
+    double hostRemaining = static_cast<double>(remaining)
+                           * totalPages / waf;
+    return static_cast<long long>(std::max(0.0, hostRemaining));
 }
 
 // ─── Report ───────────────────────────────────────────────────────────────────
@@ -110,6 +138,7 @@ void StatsTracker::printReport() const {
     std::cout << "  Write Amp. Factor (WAF)     : " << getWAF()           << "x\n";
     std::cout << "  GC Cycles Triggered         : " << gcInvocationCount  << "\n";
     std::cout << "  Pages Migrated by GC        : " << pagesMigrated      << "\n";
+    std::cout << "  Static Wear Level Passes    : " << staticWearLevelCount << "\n";  // Phase 3
 
     if (getWAF() <= 1.0) {
         std::cout << "  → WAF = 1.0 — no write amplification.\n";
