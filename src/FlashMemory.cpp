@@ -1,4 +1,5 @@
 #include "FlashMemory.h"
+#include <climits>
 
 FlashMemory::FlashMemory(int numBlocks, int pagesPerBlock) {
 
@@ -30,7 +31,7 @@ int FlashMemory::findFreeBlock() const {
 int FlashMemory::findLeastUsedFreeBlock() const {
 
     int bestBlock = -1;
-    int lowestEraseCount = 999999;
+    int lowestEraseCount = INT_MAX;
 
     for (int i = 0; i < (int)blocks.size(); i++) {
 
