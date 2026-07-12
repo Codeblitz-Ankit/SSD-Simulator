@@ -18,4 +18,6 @@ add_executable(ssd_simulator
     # Phase 1: GC + Stats
     src/StatsTracker.cpp
     src/GarbageCollector.cpp
+    # Phase 2: Latency Model
+    src/LatencyModel.cpp
 )

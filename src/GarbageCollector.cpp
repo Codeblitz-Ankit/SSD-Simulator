@@ -1,16 +1,22 @@
 #include "GarbageCollector.h"
 #include <iostream>
 
+// ─── Constructor ──────────────────────────────────────────────────────────────
+
 GarbageCollector::GarbageCollector(
-    FlashMemory&  flash,
-    FTLMapper&    mapper,
-    StatsTracker& stats
+    FlashMemory&        flash,
+    FTLMapper&          mapper,
+    StatsTracker&       stats,
+    const LatencyModel& latency
 )
     : flash(flash),
       mapper(mapper),
-      stats(stats) {}
+      stats(stats),
+      latency(latency),
+      verbose(true)
+{}
 
-// ─── Victim Selection ────────────────────────────────────────────────────────
+// ─── Victim Selection ─────────────────────────────────────────────────────────
 
 int GarbageCollector::selectVictimBlock() const {
 
@@ -30,7 +36,7 @@ int GarbageCollector::selectVictimBlock() const {
     return bestBlock;
 }
 
-// ─── Watermark Check ─────────────────────────────────────────────────────────
+// ─── Watermark Check ──────────────────────────────────────────────────────────
 
 bool GarbageCollector::shouldTrigger(double lowWatermarkPercent) const {
 
@@ -41,29 +47,35 @@ bool GarbageCollector::shouldTrigger(double lowWatermarkPercent) const {
     return (static_cast<double>(free) / total) < lowWatermarkPercent;
 }
 
-// ─── Main GC Cycle ───────────────────────────────────────────────────────────
+// ─── Main GC Cycle ────────────────────────────────────────────────────────────
 
 bool GarbageCollector::runOneCycle() {
 
     int victimIdx = selectVictimBlock();
 
     if (victimIdx == -1) {
-        std::cout << "[GC] No reclaimable block found — skipping.\n";
+        if (verbose) {
+            std::cout << "[GC] No reclaimable block found — skipping.\n";
+        }
         return false;
     }
 
+    // Use a non-const ref through the non-const getBlock overload
     Block& victim = flash.getBlock(victimIdx);
 
-    std::cout << "[GC] >>> Cycle triggered. "
-              << "Victim = Block " << victimIdx
-              << "  (invalid=" << victim.getInvalidPageCount()
-              << ", valid="   << victim.getValidPageCount()
-              << ", free="    << victim.getFreePageCount()
-              << ")\n";
+    if (verbose) {
+        std::cout << "[GC] >>> Cycle triggered. "
+                  << "Victim = Block " << victimIdx
+                  << "  (invalid=" << victim.getInvalidPageCount()
+                  << ", valid="   << victim.getValidPageCount()
+                  << ", free="    << victim.getFreePageCount()
+                  << ")\n";
+    }
 
     stats.recordGCInvocation();
 
-    // ── Step 1: Migrate valid pages out of victim block ──────────────────────
+    // ── Step 1: Migrate valid pages out of victim block ───────────────────
+
     for (int p = 0; p < victim.getTotalPages(); p++) {
 
         Page& page = victim.getPage(p);
@@ -80,9 +92,11 @@ bool GarbageCollector::runOneCycle() {
         int lba = mapper.findLogicalAddress(srcAddr);
 
         if (lba == -1) {
-            // Orphaned page — no active LBA points here (data-race guard)
-            std::cout << "[GC]   WARNING: orphaned valid page at ("
-                      << victimIdx << "," << p << ") — skipping.\n";
+            // Orphaned page — no active LBA points here (should not happen)
+            if (verbose) {
+                std::cout << "[GC]   WARNING: orphaned valid page at ("
+                          << victimIdx << "," << p << ") — skipping.\n";
+            }
             continue;
         }
 
@@ -90,8 +104,10 @@ bool GarbageCollector::runOneCycle() {
         PhysicalAddress dst = flash.findFreeSlot(victimIdx);
 
         if (dst.blockIndex == -1) {
-            std::cout << "[GC]   ERROR: no free slot for migration of LBA "
-                      << lba << " — aborting cycle.\n";
+            if (verbose) {
+                std::cout << "[GC]   ERROR: no free slot for migration of LBA "
+                          << lba << " — aborting cycle.\n";
+            }
             return false;
         }
 
@@ -101,22 +117,31 @@ bool GarbageCollector::runOneCycle() {
              .getPage(dst.pageIndex)
              .writeData(data);
 
-        // Update FTL mapping:  LBA → new physical address
+        // Update FTL mapping: LBA → new physical address
         mapper.removeMapping(lba);
         mapper.mapLogicalToPhysical(lba, dst);
 
+        // Accounting: migration is a physical write + carries page-program cost
         stats.recordPageMigrated();
+        stats.chargeGCLatency(latency.pageWriteUs);   // Phase 2: migration cost
 
-        std::cout << "[GC]   Migrated LBA " << lba
-                  << " : (" << victimIdx << "," << p << ")"
-                  << " -> ("  << dst.blockIndex << "," << dst.pageIndex << ")\n";
+        if (verbose) {
+            std::cout << "[GC]   Migrated LBA " << lba
+                      << " : (" << victimIdx << "," << p << ")"
+                      << " -> ("  << dst.blockIndex << "," << dst.pageIndex << ")\n";
+        }
     }
 
-    // ── Step 2: Erase victim block ────────────────────────────────────────────
+    // ── Step 2: Erase victim block ────────────────────────────────────────
+
     victim.eraseBlock();
 
-    std::cout << "[GC] <<< Block " << victimIdx
-              << " erased. Erase count = " << victim.getEraseCount() << "\n\n";
+    stats.chargeGCLatency(latency.blockEraseUs);   // Phase 2: erase cost
+
+    if (verbose) {
+        std::cout << "[GC] <<< Block " << victimIdx
+                  << " erased. Erase count = " << victim.getEraseCount() << "\n\n";
+    }
 
     return true;
 }

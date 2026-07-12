@@ -1,25 +1,33 @@
 #include "SSDController.h"
 #include <iostream>
 
-// ─── Constructor ─────────────────────────────────────────────────────────────
+// ─── Constructor ──────────────────────────────────────────────────────────────
 //
-// Member initialisation order must match declaration order in the header:
-//   flashMemory → mapper → stats → gc → lowWatermarkPercent
+// Initialisation order MUST match declaration order in the header:
+//   flashMemory → mapper → stats → latency → gc → lowWatermarkPercent
 //
-// GarbageCollector holds references to flashMemory, mapper, and stats, so those
-// three must be fully constructed first — which is guaranteed by declaration order.
+// GarbageCollector holds const-refs to flashMemory, mapper, stats, and latency,
+// so all four must be fully constructed before gc is initialised.
 
 SSDController::SSDController(
-    int    numBlocks,
-    int    pagesPerBlock,
-    double lowWatermark
+    int          numBlocks,
+    int          pagesPerBlock,
+    double       lowWatermark,
+    LatencyModel model
 )
     : flashMemory(numBlocks, pagesPerBlock),
       mapper(),
       stats(),
-      gc(flashMemory, mapper, stats),
+      latency(model),
+      gc(flashMemory, mapper, stats, latency),
       lowWatermarkPercent(lowWatermark)
 {}
+
+// ─── setVerbose ───────────────────────────────────────────────────────────────
+
+void SSDController::setVerbose(bool v) {
+    gc.setVerbose(v);
+}
 
 // ─── Write ────────────────────────────────────────────────────────────────────
 
@@ -30,12 +38,13 @@ void SSDController::write(
     // 1. Count this as one logical write from the host
     stats.recordLogicalWrite();
 
-    // 2. Trigger GC if free-page ratio has dropped below the watermark
+    // 2. Trigger GC if free-page ratio has dropped below the watermark.
+    //    GC charges its own latency (erase + migration) into stats.
     if (gc.shouldTrigger(lowWatermarkPercent)) {
         gc.runOneCycle();
     }
 
-    // 3. Find a free block (prefer lowest erase count → basic wear levelling)
+    // 3. Find a free block (prefer lowest erase count → dynamic wear leveling)
     int freeBlock = flashMemory.findLeastUsedFreeBlock();
 
     if (freeBlock == -1) {
@@ -51,44 +60,47 @@ void SSDController::write(
         }
     }
 
-    int freePage =
-        flashMemory.getBlock(freeBlock).getFreePageIndex();
+    int freePage = flashMemory.getBlock(freeBlock).getFreePageIndex();
 
-    // 4. Program the page
+    // 4. Program the NAND page
     flashMemory.getBlock(freeBlock)
                .getPage(freePage)
                .writeData(data);
 
-    stats.recordPhysicalWrite();   // host write counts as one physical write
+    // 5. Charge timing: one page program for this host write
+    stats.recordPhysicalWrite();
+    stats.chargeWriteLatency(latency.pageWriteUs);   // Phase 2
 
-    // 5. Invalidate the previously mapped physical page (out-of-place update)
+    // 6. Invalidate the previously mapped physical page (out-of-place update)
     PhysicalAddress newAddr;
     newAddr.blockIndex = freeBlock;
     newAddr.pageIndex  = freePage;
 
     if (mapper.hasMapping(logicalAddress)) {
-
         PhysicalAddress oldAddr = mapper.removeMapping(logicalAddress);
-
         flashMemory.getBlock(oldAddr.blockIndex)
                    .getPage(oldAddr.pageIndex)
                    .invalidate();
     }
 
-    // 6. Update FTL mapping: LBA → new physical address
+    // 7. Update FTL: LBA → new physical address
     mapper.mapLogicalToPhysical(logicalAddress, newAddr);
 }
 
 // ─── Read ─────────────────────────────────────────────────────────────────────
 
-std::string SSDController::read(
-    int logicalAddress
-) {
+std::string SSDController::read(int logicalAddress) {
+
+    // Count host read, charge NAND read latency (Phase 2)
+    stats.recordLogicalRead();
+
     if (!mapper.hasMapping(logicalAddress)) {
         return "[ERROR: LBA " + std::to_string(logicalAddress) + " not mapped]";
     }
 
     PhysicalAddress addr = mapper.getPhysicalAddress(logicalAddress);
+
+    stats.chargeReadLatency(latency.pageReadUs);   // Phase 2
 
     return flashMemory.getBlock(addr.blockIndex)
                       .getPage(addr.pageIndex)
