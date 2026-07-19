@@ -14,6 +14,7 @@ add_executable(ssd_simulator
     src/FTLMapper.cpp
     src/SSDController.cpp
     src/WriteRequest.cpp
+    src/ReadRequest.cpp        # Phase 5: read I/O request
     src/RequestQueue.cpp
     # Phase 1: GC + Stats
     src/StatsTracker.cpp
@@ -22,4 +23,6 @@ add_executable(ssd_simulator
     src/LatencyModel.cpp
     # Phase 4: DRAM Page Cache
     src/PageCache.cpp
+    # Phase 5: Trace File Parser
+    src/TraceParser.cpp
 )

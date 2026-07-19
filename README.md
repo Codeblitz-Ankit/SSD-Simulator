@@ -1,6 +1,6 @@
 # SSD Simulator
 
-A **realistic, parameterizable NAND Flash SSD Simulator** written in modern C++17. This project models the core internals of an SSD controller — including out-of-place writes, Flash Translation Layer (FTL) mapping, garbage collection with valid-page migration, and Write Amplification Factor (WAF) measurement — and is being progressively upgraded to benchmark-grade fidelity.
+A **realistic, parameterizable NAND Flash SSD Simulator** written in modern C++17. This project models the core internals of an SSD controller — including out-of-place writes, Flash Translation Layer (FTL) mapping, garbage collection with valid-page migration, Write Amplification Factor (WAF) measurement, latency modelling, wear leveling, DRAM write buffering, trace-file workload replay, and an interactive web visualizer.
 
 ---
 
@@ -14,13 +14,17 @@ Host Application (main.cpp)
 │         SSDController               │
 │  ┌──────────────┐ ┌──────────────┐  │
 │  │  FTLMapper   │ │ StatsTracker │  │
-│  │  LBA → PBA   │ │ WAF/GC stats │  │
-│  │  PBA → LBA   │ │              │  │
+│  │  LBA → PBA   │ │ WAF/GC/IOPS │  │
+│  │  PBA → LBA   │ │  Latency    │  │
+│  └──────────────┘ └──────────────┘  │
+│  ┌──────────────┐ ┌──────────────┐  │
+│  │  PageCache   │ │LatencyModel  │  │
+│  │  DRAM LRU   │ │SLC/MLC/TLC  │  │
 │  └──────────────┘ └──────────────┘  │
 │  ┌──────────────────────────────┐   │
 │  │       GarbageCollector       │   │
 │  │  Victim select → Migrate →   │   │
-│  │  Erase (watermark-triggered) │   │
+│  │  Erase + Static Wear Level   │   │
 │  └──────────────────────────────┘   │
 │  ┌──────────────────────────────┐   │
 │  │        FlashMemory           │   │
@@ -28,30 +32,70 @@ Host Application (main.cpp)
 │  │   Page[]   Page[]   Page[]   │   │
 │  └──────────────────────────────┘   │
 └─────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────┐
+│   Trace Parser + Request Queue      │
+│   (Phase 5: workload replay)        │
+└─────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────┐
+│   Web Visualizer Dashboard          │
+│   visualizer/index.html (Phase 6)  │
+└─────────────────────────────────────┘
 ```
 
 ---
 
-## Features (Phase 1 Complete ✅)
+## Features
 
-### Core Storage Model
+### Phase 1 — Core Storage Model ✅
 - **Page → Block → FlashMemory** hierarchy modelling NAND flash storage
 - **Out-of-place writes**: pages cannot be overwritten in-place — new writes always go to a free page; old page is marked invalid (exact NAND constraint)
 - **Flash Translation Layer (FTL)**: O(1) forward lookup (`LBA → PBA`) + O(n) reverse lookup (`PBA → LBA`) via `FTLMapper`
+- **Garbage Collector**: watermark-triggered, greedy victim selection, valid-page migration
+- **Write Amplification Factor (WAF)**: `StatsTracker` tracks every logical write and physical NAND page program
 
-### Garbage Collector
-- **Watermark-triggered**: GC fires automatically when free-page ratio drops below a configurable threshold (default 20%)
-- **Greedy victim selection**: always picks the block with the most invalid pages — maximises space reclaimed per erase cycle
-- **Valid-page migration**: surviving live pages are copied to a free slot in another block, with FTL remapping, before the victim block is erased
-- **Forced fallback**: if watermark GC isn't enough, a second forced cycle runs before declaring the SSD full
+### Phase 2 — Latency Model + IOPS ✅
+- **LatencyModel**: Real NAND flash timing constants for SLC / MLC / TLC grades
+  - SLC: 50 µs read / 500 µs write / 2 ms erase
+  - MLC: 70 µs read / 1.8 ms write / 3.5 ms erase
+  - TLC: 100 µs read / 3 ms write / 5 ms erase
+- **Latency accounting**: `StatsTracker` accumulates host-read, host-write, and GC latency separately
+- **IOPS estimation**: `getIOPS()` = total ops / total simulated time
+- **Amortized write latency**: GC cost spread across all host writes that triggered it
 
-### Write Amplification Factor (WAF)
-- `StatsTracker` tracks every logical write (host) and every physical NAND page program (host + GC migration)
-- `WAF = physicalWrites / logicalWrites` — printed live at end of run
-- Also reports: GC invocations, pages migrated, breakdown of amplification source
+### Phase 3 — Wear Leveling + Lifespan Estimation ✅
+- **Dynamic wear leveling**: `findLeastUsedFreeBlock()` always writes to the lowest-erase-count block
+- **Static wear leveling**: automatically triggered every N GC cycles; moves cold data from fresh blocks onto worn free blocks, then erases the fresh blocks for hot-write traffic — reduces erase variance
+- **Lifespan estimate**: `estimateRemainingWrites(peLimit, maxErase, totalPages)` predicts host writes remaining before the most-worn block hits its P/E limit
+- **Wear analysis display**: ASCII erase-count bar chart + statistical summary (mean, variance, std dev, spread)
 
-### Wear-Aware Block Allocation
-- `findLeastUsedFreeBlock()` always picks the free block with the lowest erase count — basic dynamic wear leveling out of the box
+### Phase 4 — DRAM Page Cache (LRU) ✅
+- **O(1) LRU cache**: doubly-linked list + `unordered_map` — classic optimal LRU design
+- **Write coalescing**: writes to an LBA already cached avoid a NAND program entirely
+- **Read-through**: cache hit returns at DRAM latency (~0.1 µs); miss falls through to NAND, then inserts clean entry
+- **Dirty-eviction flush**: LRU evictions of dirty entries trigger a background NAND write
+- **Cache metrics**: hit ratio, writes coalesced, dirty evictions — demonstrated in `main.cpp` Phase 4 scenario
+- **15× IOPS improvement** demonstrated (90.7% hit rate on a hot-write workload)
+
+### Phase 5 — Trace File Parser + Workload Replay ✅
+- **Trace file format**: simple text format with `W <LBA> <data>` and `R <LBA>` operations (comments with `#`)
+- **TraceParser**: reads trace files and populates a `RequestQueue` with `WriteRequest` / `ReadRequest` objects
+- **RequestQueue**: thread-safe queue of polymorphic `IORequest` objects
+- **Sample trace**: `traces/sample.trace` — cold fill, hot rewrites, and read verification
+
+### Phase 6 — Web Visualizer Dashboard ✅
+- **Live animated NAND heatmap**: per-block page state (free/valid/invalid) with flash animation on write
+- **WAF over time chart**: tracks write amplification factor across all operations
+- **Erase count bar chart**: per-block wear distribution (worn-out blocks shown in red)
+- **IOPS over time chart**: estimated throughput as simulation runs
+- **LRU cache donut chart**: hits vs misses with coalesced write count
+- **GC event log**: real-time event stream with color-coded categories (GC, WL, errors)
+- **Configurable parameters**: geometry, NAND grade, watermark, cache size, wear-level interval, workload shape
+- **Playback speed control**: 1×, 5×, 20×, or max speed
+- Open `visualizer/index.html` in any modern browser — **no server needed**
 
 ---
 
@@ -68,58 +112,40 @@ make
 ./ssd_simulator
 ```
 
+The simulator binary should be run from the `build/` directory (default). The trace file is resolved relative to the project root automatically.
+
 ---
 
-## Demo Output (Phase 1)
+## Trace File Format (Phase 5)
 
-Workload: 4 blocks × 4 pages SSD, 12 unique LBAs written once, then 3 "hot" LBAs rewritten 40× each.
+Create a `.trace` file with one operation per line:
 
 ```
-============================================================
-  SSD Simulator — Phase 1: Realistic GC + WAF
-============================================================
-  Geometry  : 4 blocks x 4 pages = 16 pages total
-  Watermark : 25%  (GC fires when free pages < 4)
-  Phase A   : write 12 LBAs once
-  Phase B   : overwrite 3 hot LBAs x 40 times
-============================================================
-
---- Phase A: Initial write to all 12 LBAs ---
---- Phase B: Overwrite hot LBAs 40 times each ---
-
-[GC] >>> Cycle triggered. Victim = Block 0  (invalid=1, valid=3, free=0)
-[GC]   Migrated LBA 20 : (0,0) -> (3,1)
-[GC]   Migrated LBA 10 : (0,1) -> (3,2)
-[GC]   Migrated LBA 30 : (0,3) -> (3,3)
-[GC] <<< Block 0 erased. Erase count = 1
-...
-  (Total host writes: 132)
-
---- Final Read Verification ---
-  LBA 0  -> "hot_v39_LBA0"
-  LBA 10 -> "hot_v39_LBA10"
-  LBA 20 -> "hot_v39_LBA20"
-  LBA 30 -> "init_LBA30"       ← cold data preserved correctly
-  ...
-
-===== SSD BLOCK STATUS =====
-  Block 0 | Free: 3 | Valid: 1 | Invalid: 0 | Erases: 60
-  Block 1 | Free: 0 | Valid: 4 | Invalid: 0 | Erases: 0
-  Block 2 | Free: 0 | Valid: 4 | Invalid: 0 | Erases: 0
-  Block 3 | Free: 0 | Valid: 3 | Invalid: 1 | Erases: 59
-============================
-
-============================================
-            SIMULATION STATS REPORT
-============================================
-  Logical Writes   (host)     : 132
-  Physical Writes  (NAND)     : 489
-  Write Amplification (WAF)   : 3.70x
-  GC Cycles Triggered         : 119
-  Pages Migrated by GC        : 357
-============================================
-  [WAF > 1.0 — GC wrote 357 extra pages beyond host requests]
+# This is a comment
+W 0 some_data_here         # write "some_data_here" to LBA 0
+W 10 more_data             # write to LBA 10
+R 0                        # read from LBA 0
+R 10                       # read from LBA 10
 ```
+
+| Token | Meaning |
+|---|---|
+| `W <LBA> <data>` | Write `data` (rest of line, may contain spaces) to LBA |
+| `R <LBA>` | Read from LBA |
+| `# ...` | Comment — ignored |
+| (blank line) | Ignored |
+
+---
+
+## Web Visualizer (Phase 6)
+
+Open `visualizer/index.html` in any modern browser (Chrome, Firefox, Safari, Edge).
+
+1. Configure geometry and workload in the left sidebar
+2. Click **▶ Run Simulation**
+3. Watch the NAND block map, WAF chart, erase distribution, IOPS and cache charts update live
+4. Hover over individual pages in the block map to see their state and LBA mapping
+5. Use speed controls (1×, 5×, 20×, Max) to adjust playback rate
 
 ---
 
@@ -129,28 +155,40 @@ Workload: 4 blocks × 4 pages SSD, 12 unique LBAs written once, then 3 "hot" LBA
 ssd_simulator/
 ├── include/
 │   ├── Page.h               # NAND page (free/valid/invalid states)
-│   ├── Block.h              # Block of pages + erase count
-│   ├── FlashMemory.h        # Array of blocks + free-slot finder
+│   ├── Block.h              # Block of pages + erase count + PE limit
+│   ├── FlashMemory.h        # Array of blocks + wear-level helpers
 │   ├── FTLMapper.h          # LBA↔PBA mapping table
 │   ├── PhysicalAddress.h    # {blockIndex, pageIndex} struct
-│   ├── GarbageCollector.h   # Greedy GC with valid-page migration
-│   ├── StatsTracker.h       # WAF + GC metrics
+│   ├── GarbageCollector.h   # Greedy GC + static wear leveling
+│   ├── StatsTracker.h       # WAF + GC + latency + IOPS metrics
+│   ├── LatencyModel.h       # NAND timing constants (SLC/MLC/TLC)
+│   ├── PageCache.h          # DRAM LRU write buffer / read cache
 │   ├── SSDController.h      # Top-level controller (write/read/GC)
 │   ├── IORequest.h          # Abstract IO operation interface
 │   ├── WriteRequest.h       # Concrete write IO request
-│   └── RequestQueue.h       # Thread-safe IO request queue
+│   ├── ReadRequest.h        # Concrete read IO request  [Phase 5]
+│   ├── RequestQueue.h       # Thread-safe IO request queue
+│   └── TraceParser.h        # Trace file parser          [Phase 5]
 ├── src/
-│   ├── main.cpp             # Phase 1 WAF demo workload
+│   ├── main.cpp             # Phases 3/4/5 demo workloads
 │   ├── Page.cpp
 │   ├── Block.cpp
 │   ├── FlashMemory.cpp
 │   ├── FTLMapper.cpp
 │   ├── GarbageCollector.cpp
 │   ├── StatsTracker.cpp
+│   ├── LatencyModel.cpp
+│   ├── PageCache.cpp
 │   ├── SSDController.cpp
 │   ├── WriteRequest.cpp
-│   └── RequestQueue.cpp
-├── tests/                   # Unit tests (Phase 2+)
+│   ├── ReadRequest.cpp      # [Phase 5]
+│   ├── RequestQueue.cpp
+│   └── TraceParser.cpp      # [Phase 5]
+├── traces/
+│   └── sample.trace         # Mixed cold/hot/read workload trace
+├── visualizer/
+│   └── index.html           # Interactive web dashboard [Phase 6]
+├── tests/                   # Unit tests (future)
 ├── docs/
 ├── CMakeLists.txt
 └── README.md
@@ -168,6 +206,12 @@ ssd_simulator/
 | **Garbage Collection** | `GarbageCollector` — victim pick, live-page migration, block erase |
 | **Write Amplification Factor** | `StatsTracker::getWAF()` — physical writes ÷ logical writes |
 | **Dynamic Wear Leveling** | `FlashMemory::findLeastUsedFreeBlock()` — always writes to lowest-erase-count block |
+| **Static Wear Leveling** | `GarbageCollector::staticWearLevel()` — cold-data migration to reduce erase variance |
+| **Lifespan Estimation** | `StatsTracker::estimateRemainingWrites()` — remaining host writes before first block wears out |
+| **NAND Timing Model** | `LatencyModel` — SLC/MLC/TLC tR / tPROG / tBERS constants |
+| **DRAM Write Buffer / LRU Cache** | `PageCache` — write coalescing + read-through with O(1) LRU eviction |
+| **Trace-driven Workloads** | `TraceParser` + `RequestQueue` — replay `W`/`R` operations from text files |
+| **Live Web Visualizer** | `visualizer/index.html` — interactive JS simulation with canvas charts |
 
 ---
 
@@ -175,12 +219,12 @@ ssd_simulator/
 
 | Phase | Feature | Status |
 |---|---|---|
-| 1 | **Realistic GC + WAF tracking** | ✅ Complete — WAF 3.70x demonstrated |
-| 2 | **Latency model + IOPS** | 🔜 Next — 50µs read / 500µs write / 2ms erase |
-| 3 | **Wear leveling + lifespan estimation** | 📋 Planned |
-| 4 | **DRAM page cache (LRU)** | 📋 Planned |
-| 5 | **Trace file parser + workload replay** | 📋 Planned |
-| 6 | **Web visualizer dashboard** | 📋 Planned |
+| 1 | **Realistic GC + WAF tracking** | ✅ Complete |
+| 2 | **Latency model + IOPS** | ✅ Complete |
+| 3 | **Wear leveling + lifespan estimation** | ✅ Complete |
+| 4 | **DRAM page cache (LRU)** | ✅ Complete — 15× IOPS gain demonstrated |
+| 5 | **Trace file parser + workload replay** | ✅ Complete |
+| 6 | **Web visualizer dashboard** | ✅ Complete |
 
 ---
 
