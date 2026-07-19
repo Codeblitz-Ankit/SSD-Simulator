@@ -1,0 +1,95 @@
+# SSD Simulator — Sample Workload Trace (Phase 5)
+#
+# Format:
+#   W <LBA> <data>   — write <data> to logical block address <LBA>
+#   R <LBA>          — read logical block address <LBA>
+#   # ...            — comment (ignored)
+#   (blank lines)    — ignored
+#
+# Geometry assumed: 8 blocks × 8 pages (64 pages, SLC timing)
+# This trace models a realistic mixed read/write workload:
+#   Phase A — Cold fill: write 16 unique LBAs once (database initial load)
+#   Phase B — Hot overwrites: repeatedly rewrite 4 "hot" LBAs (journaling)
+#   Phase C — Read verification: read all 16 cold LBAs + 4 hot LBAs
+
+# ─── Phase A: Cold fill ───────────────────────────────────────────────────────
+W 0 cold_init_lba0
+W 10 cold_init_lba10
+W 20 cold_init_lba20
+W 30 cold_init_lba30
+W 40 cold_init_lba40
+W 50 cold_init_lba50
+W 60 cold_init_lba60
+W 70 cold_init_lba70
+W 80 cold_init_lba80
+W 90 cold_init_lba90
+W 100 cold_init_lba100
+W 110 cold_init_lba110
+W 120 cold_init_lba120
+W 130 cold_init_lba130
+W 140 cold_init_lba140
+W 150 cold_init_lba150
+
+# ─── Phase B: Hot overwrites (simulates write-heavy journal / WAL) ────────────
+W 200 hot_v01_lba200
+W 210 hot_v01_lba210
+W 220 hot_v01_lba220
+W 230 hot_v01_lba230
+W 200 hot_v02_lba200
+W 210 hot_v02_lba210
+W 220 hot_v02_lba220
+W 230 hot_v02_lba230
+W 200 hot_v03_lba200
+W 210 hot_v03_lba210
+W 220 hot_v03_lba220
+W 230 hot_v03_lba230
+W 200 hot_v04_lba200
+W 210 hot_v04_lba210
+W 220 hot_v04_lba220
+W 230 hot_v04_lba230
+W 200 hot_v05_lba200
+W 210 hot_v05_lba210
+W 220 hot_v05_lba220
+W 230 hot_v05_lba230
+W 200 hot_v06_lba200
+W 210 hot_v06_lba210
+W 220 hot_v06_lba220
+W 230 hot_v06_lba230
+W 200 hot_v07_lba200
+W 210 hot_v07_lba210
+W 220 hot_v07_lba220
+W 230 hot_v07_lba230
+W 200 hot_v08_lba200
+W 210 hot_v08_lba210
+W 220 hot_v08_lba220
+W 230 hot_v08_lba230
+W 200 hot_v09_lba200
+W 210 hot_v09_lba210
+W 220 hot_v09_lba220
+W 230 hot_v09_lba230
+W 200 hot_v10_lba200
+W 210 hot_v10_lba210
+W 220 hot_v10_lba220
+W 230 hot_v10_lba230
+
+# ─── Phase C: Read verification (simulate checkpoint / query scan) ────────────
+R 0
+R 10
+R 20
+R 30
+R 40
+R 50
+R 60
+R 70
+R 80
+R 90
+R 100
+R 110
+R 120
+R 130
+R 140
+R 150
+R 200
+R 210
+R 220
+R 230
