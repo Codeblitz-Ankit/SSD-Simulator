@@ -1,0 +1,1636 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SSD Simulator — Live Visualizer Dashboard</title>
+  <meta name="description" content="Interactive NAND Flash SSD Simulator dashboard. Configure geometry, run workloads, and watch WAF, GC cycles, wear distribution and cache metrics animate in real-time." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    /* ── Design tokens ──────────────────────────────────────────────────── */
+    :root {
+      --bg:          #0d1117;
+      --surface:     #161b22;
+      --surface2:    #21262d;
+      --border:      #30363d;
+      --accent:      #58a6ff;
+      --accent2:     #3fb950;
+      --warn:        #f0883e;
+      --danger:      #f85149;
+      --text:        #e6edf3;
+      --muted:       #8b949e;
+      --free-color:  #238636;
+      --valid-color: #1f6feb;
+      --invalid-color: #b91c1c;
+      --font:        'Inter', system-ui, sans-serif;
+      --mono:        'JetBrains Mono', 'Fira Code', monospace;
+      --radius:      10px;
+      --shadow:      0 4px 24px rgba(0,0,0,0.4);
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      line-height: 1.5;
+    }
+
+    /* ── Header ─────────────────────────────────────────────────────────── */
+    header {
+      background: linear-gradient(135deg, #0d1117 0%, #161b22 50%, #1c2128 100%);
+      border-bottom: 1px solid var(--border);
+      padding: 1.5rem 2rem;
+      display: flex;
+      align-items: center;
+      gap: 1.2rem;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      backdrop-filter: blur(12px);
+    }
+
+    .logo {
+      width: 44px;
+      height: 44px;
+      background: linear-gradient(135deg, var(--accent), #a371f7);
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.4rem;
+      flex-shrink: 0;
+      box-shadow: 0 0 20px rgba(88,166,255,0.3);
+    }
+
+    header h1 {
+      font-size: 1.35rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      background: linear-gradient(90deg, var(--text), var(--accent));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    header p {
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-top: 0.1rem;
+    }
+
+    .header-right {
+      margin-left: auto;
+      display: flex;
+      gap: 0.75rem;
+      align-items: center;
+    }
+
+    .badge {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 0.25rem 0.75rem;
+      font-size: 0.72rem;
+      color: var(--muted);
+      font-family: var(--mono);
+    }
+    .badge.live { border-color: var(--accent2); color: var(--accent2); }
+    .badge.live::before {
+      content: '● ';
+      animation: blink 1.2s infinite;
+    }
+    @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0.2; } }
+
+    /* ── Layout ─────────────────────────────────────────────────────────── */
+    main {
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      gap: 0;
+      min-height: calc(100vh - 80px);
+    }
+
+    /* ── Sidebar ─────────────────────────────────────────────────────────── */
+    aside {
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      padding: 1.5rem;
+      overflow-y: auto;
+      position: sticky;
+      top: 80px;
+      height: calc(100vh - 80px);
+    }
+
+    .section-title {
+      font-size: 0.7rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--muted);
+      margin-bottom: 1rem;
+    }
+
+    .form-group {
+      margin-bottom: 1rem;
+    }
+
+    label {
+      display: block;
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-bottom: 0.35rem;
+      font-weight: 500;
+    }
+
+    label span.val {
+      float: right;
+      color: var(--accent);
+      font-family: var(--mono);
+      font-size: 0.78rem;
+    }
+
+    input[type="range"] {
+      width: 100%;
+      -webkit-appearance: none;
+      height: 4px;
+      border-radius: 2px;
+      background: var(--border);
+      outline: none;
+      cursor: pointer;
+    }
+    input[type="range"]::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: var(--accent);
+      cursor: pointer;
+      box-shadow: 0 0 8px rgba(88,166,255,0.5);
+      transition: transform 0.15s;
+    }
+    input[type="range"]::-webkit-slider-thumb:hover { transform: scale(1.2); }
+
+    select {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      padding: 0.5rem 0.75rem;
+      font-family: var(--font);
+      font-size: 0.82rem;
+      cursor: pointer;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    select:focus { border-color: var(--accent); }
+
+    .divider {
+      border: none;
+      border-top: 1px solid var(--border);
+      margin: 1.25rem 0;
+    }
+
+    .btn {
+      display: block;
+      width: 100%;
+      padding: 0.75rem 1rem;
+      border: none;
+      border-radius: var(--radius);
+      font-family: var(--font);
+      font-size: 0.88rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+      text-align: center;
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent), #a371f7);
+      color: #fff;
+      box-shadow: 0 4px 12px rgba(88,166,255,0.3);
+    }
+    .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(88,166,255,0.4); }
+    .btn-primary:active { transform: translateY(0); }
+
+    .btn-secondary {
+      background: var(--surface2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      margin-top: 0.5rem;
+    }
+    .btn-secondary:hover { border-color: var(--accent); color: var(--accent); }
+
+    .btn-danger {
+      background: rgba(248,81,73,0.15);
+      color: var(--danger);
+      border: 1px solid rgba(248,81,73,0.3);
+      margin-top: 0.5rem;
+    }
+    .btn-danger:hover { background: rgba(248,81,73,0.25); }
+
+    /* speed picker */
+    .speed-row {
+      display: flex;
+      gap: 0.5rem;
+      margin-top: 0.5rem;
+    }
+    .speed-btn {
+      flex: 1;
+      padding: 0.4rem;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--muted);
+      font-size: 0.75rem;
+      font-family: var(--mono);
+      cursor: pointer;
+      text-align: center;
+      transition: all 0.15s;
+    }
+    .speed-btn.active { border-color: var(--accent); color: var(--accent); background: rgba(88,166,255,0.08); }
+
+    /* ── Dashboard right area ───────────────────────────────────────────── */
+    .dashboard {
+      padding: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.25rem;
+      overflow-y: auto;
+    }
+
+    /* ── KPI row ────────────────────────────────────────────────────────── */
+    .kpi-row {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 1rem;
+    }
+
+    .kpi {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1rem 1.1rem;
+      position: relative;
+      overflow: hidden;
+      transition: border-color 0.3s;
+    }
+    .kpi::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 2px;
+      background: var(--kpi-color, var(--accent));
+      border-radius: 2px 2px 0 0;
+    }
+    .kpi:hover { border-color: var(--kpi-color, var(--accent)); }
+
+    .kpi-label {
+      font-size: 0.7rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-weight: 500;
+    }
+
+    .kpi-value {
+      font-size: 2rem;
+      font-weight: 700;
+      font-family: var(--mono);
+      line-height: 1.1;
+      margin: 0.3rem 0 0.15rem;
+      color: var(--kpi-color, var(--accent));
+    }
+
+    .kpi-sub {
+      font-size: 0.72rem;
+      color: var(--muted);
+      font-family: var(--mono);
+    }
+
+    /* ── Chart row ─────────────────────────────────────────────────────── */
+    .chart-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.25rem;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.1rem 1.25rem;
+    }
+
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 1rem;
+    }
+
+    .card-title {
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .card-subtitle {
+      font-size: 0.72rem;
+      color: var(--muted);
+      font-family: var(--mono);
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+    }
+
+    /* ── Flash heatmap ──────────────────────────────────────────────────── */
+    .heatmap-card {
+      grid-column: 1 / -1;
+    }
+
+    .block-grid {
+      display: flex;
+      gap: 0.6rem;
+      flex-wrap: wrap;
+      margin-top: 0.5rem;
+    }
+
+    .block-item {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.6rem;
+      min-width: 90px;
+      flex: 1;
+      transition: border-color 0.3s, box-shadow 0.3s;
+    }
+    .block-item.active { border-color: var(--warn); box-shadow: 0 0 12px rgba(240,136,62,0.3); }
+    .block-item.worn   { border-color: var(--danger); box-shadow: 0 0 12px rgba(248,81,73,0.3); }
+
+    .block-label {
+      font-family: var(--mono);
+      font-size: 0.72rem;
+      color: var(--muted);
+      margin-bottom: 0.5rem;
+    }
+
+    .page-grid {
+      display: grid;
+      gap: 3px;
+    }
+
+    .page-cell {
+      height: 10px;
+      border-radius: 2px;
+      background: var(--border);
+      transition: background 0.4s ease;
+    }
+    .page-cell.free    { background: var(--free-color);    opacity: 0.85; }
+    .page-cell.valid   { background: var(--valid-color);   opacity: 0.9; }
+    .page-cell.invalid { background: var(--invalid-color); opacity: 0.8; }
+
+    .block-stats {
+      display: flex;
+      gap: 0.4rem;
+      margin-top: 0.4rem;
+      font-size: 0.66rem;
+      font-family: var(--mono);
+    }
+    .block-stats span { padding: 1px 5px; border-radius: 3px; }
+    .bs-free    { background: rgba(35,134,54,0.25);  color: #3fb950; }
+    .bs-valid   { background: rgba(31,111,235,0.25); color: #58a6ff; }
+    .bs-invalid { background: rgba(185,28,28,0.25);  color: #f85149; }
+    .bs-erase   { background: rgba(255,255,255,0.05); color: var(--muted); }
+
+    /* ── Log panel ──────────────────────────────────────────────────────── */
+    .log-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+    }
+
+    .log-header {
+      padding: 0.8rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .log-body {
+      font-family: var(--mono);
+      font-size: 0.76rem;
+      line-height: 1.7;
+      padding: 0.75rem 1.25rem;
+      max-height: 200px;
+      overflow-y: auto;
+      color: var(--muted);
+    }
+
+    .log-body::-webkit-scrollbar { width: 4px; }
+    .log-body::-webkit-scrollbar-track { background: transparent; }
+    .log-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+    .log-entry { padding: 0.1rem 0; }
+    .log-entry.gc  { color: var(--warn); }
+    .log-entry.wl  { color: #a371f7; }
+    .log-entry.ok  { color: var(--accent2); }
+    .log-entry.err { color: var(--danger); }
+    .log-entry.info { color: var(--muted); }
+
+    /* ── Legend ─────────────────────────────────────────────────────────── */
+    .legend {
+      display: flex;
+      gap: 1rem;
+      align-items: center;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 0.35rem;
+      font-size: 0.72rem;
+      color: var(--muted);
+    }
+    .legend-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+    }
+
+    /* ── Progress bar ────────────────────────────────────────────────────── */
+    .progress-wrap {
+      background: var(--surface2);
+      border-radius: 4px;
+      height: 6px;
+      overflow: hidden;
+      margin-top: 0.5rem;
+    }
+    .progress-bar {
+      height: 100%;
+      border-radius: 4px;
+      background: linear-gradient(90deg, var(--accent), #a371f7);
+      transition: width 0.3s ease;
+    }
+
+    /* ── Responsive ─────────────────────────────────────────────────────── */
+    @media (max-width: 1100px) {
+      main { grid-template-columns: 1fr; }
+      aside { position: relative; top: 0; height: auto; }
+      .kpi-row { grid-template-columns: repeat(3, 1fr); }
+      .chart-row { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 600px) {
+      .kpi-row { grid-template-columns: repeat(2, 1fr); }
+      header h1 { font-size: 1.1rem; }
+    }
+
+    /* ── Animations ─────────────────────────────────────────────────────── */
+    .kpi-value.pulse {
+      animation: kpipulse 0.4s ease;
+    }
+    @keyframes kpipulse {
+      0%   { transform: scale(1); }
+      50%  { transform: scale(1.08); }
+      100% { transform: scale(1); }
+    }
+
+    .flash-write {
+      animation: flashcell 0.5s ease;
+    }
+    @keyframes flashcell {
+      0%   { opacity: 1; filter: brightness(2.5); }
+      100% { opacity: 0.9; filter: brightness(1); }
+    }
+
+    .tooltip {
+      position: fixed;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.4rem 0.7rem;
+      font-size: 0.75rem;
+      font-family: var(--mono);
+      color: var(--text);
+      pointer-events: none;
+      z-index: 200;
+      box-shadow: var(--shadow);
+      display: none;
+    }
+  </style>
+</head>
+<body>
+
+<!-- ── Tooltip ─────────────────────────────────────────────────────────── -->
+<div id="tooltip" class="tooltip"></div>
+
+<!-- ── Header ─────────────────────────────────────────────────────────── -->
+<header>
+  <div class="logo">💾</div>
+  <div>
+    <h1>SSD Simulator — Live Visualizer</h1>
+    <p>NAND Flash Internals · FTL · GC · Wear Leveling · DRAM Cache</p>
+  </div>
+  <div class="header-right">
+    <span class="badge" id="phaseBadge">Phase 3/4/5</span>
+    <span class="badge live" id="statusBadge">Ready</span>
+  </div>
+</header>
+
+<!-- ── Layout ──────────────────────────────────────────────────────────── -->
+<main>
+
+  <!-- ── Sidebar ─────────────────────────────────────────────────────── -->
+  <aside>
+    <p class="section-title">Geometry</p>
+
+    <div class="form-group">
+      <label>Blocks <span class="val" id="blocksVal">8</span></label>
+      <input id="blocksRange" type="range" min="4" max="32" value="8" step="4"
+             oninput="document.getElementById('blocksVal').textContent=this.value" />
+    </div>
+
+    <div class="form-group">
+      <label>Pages per block <span class="val" id="pagesVal">8</span></label>
+      <input id="pagesRange" type="range" min="4" max="64" value="8" step="4"
+             oninput="document.getElementById('pagesVal').textContent=this.value" />
+    </div>
+
+    <div class="form-group">
+      <label>P/E limit <span class="val" id="peVal">50</span></label>
+      <input id="peRange" type="range" min="10" max="500" value="50" step="10"
+             oninput="document.getElementById('peVal').textContent=this.value" />
+    </div>
+
+    <hr class="divider" />
+    <p class="section-title">Firmware</p>
+
+    <div class="form-group">
+      <label>GC Watermark <span class="val" id="wmVal">25%</span></label>
+      <input id="wmRange" type="range" min="5" max="50" value="25" step="5"
+             oninput="document.getElementById('wmVal').textContent=this.value+'%'" />
+    </div>
+
+    <div class="form-group">
+      <label>NAND Grade</label>
+      <select id="nandGrade">
+        <option value="SLC">SLC — 50µs / 500µs / 2ms</option>
+        <option value="MLC" selected>MLC — 70µs / 1800µs / 3.5ms</option>
+        <option value="TLC">TLC — 100µs / 3000µs / 5ms</option>
+      </select>
+    </div>
+
+    <div class="form-group">
+      <label>Cache size (pages) <span class="val" id="cacheVal">16</span></label>
+      <input id="cacheRange" type="range" min="0" max="128" value="16" step="8"
+             oninput="document.getElementById('cacheVal').textContent=this.value" />
+    </div>
+
+    <div class="form-group">
+      <label>Static WL interval <span class="val" id="wlVal">4</span></label>
+      <input id="wlRange" type="range" min="0" max="20" value="4" step="1"
+             oninput="document.getElementById('wlVal').textContent=(this.value==0?'off':this.value)" />
+    </div>
+
+    <hr class="divider" />
+    <p class="section-title">Workload</p>
+
+    <div class="form-group">
+      <label>Cold LBAs <span class="val" id="coldVal">16</span></label>
+      <input id="coldRange" type="range" min="4" max="64" value="16" step="4"
+             oninput="document.getElementById('coldVal').textContent=this.value" />
+    </div>
+
+    <div class="form-group">
+      <label>Hot LBAs <span class="val" id="hotLbaVal">4</span></label>
+      <input id="hotLbaRange" type="range" min="1" max="16" value="4" step="1"
+             oninput="document.getElementById('hotLbaVal').textContent=this.value" />
+    </div>
+
+    <div class="form-group">
+      <label>Hot rounds <span class="val" id="hotRndVal">50</span></label>
+      <input id="hotRndRange" type="range" min="10" max="200" value="50" step="10"
+             oninput="document.getElementById('hotRndVal').textContent=this.value" />
+    </div>
+
+    <hr class="divider" />
+    <p class="section-title">Playback</p>
+
+    <div class="speed-row">
+      <div class="speed-btn" onclick="setSpeed(1)" id="sp1">1×</div>
+      <div class="speed-btn active" onclick="setSpeed(5)" id="sp5">5×</div>
+      <div class="speed-btn" onclick="setSpeed(20)" id="sp20">20×</div>
+      <div class="speed-btn" onclick="setSpeed(0)" id="sp0">Max</div>
+    </div>
+
+    <br/>
+    <button class="btn btn-primary" id="runBtn" onclick="startSim()">▶ Run Simulation</button>
+    <button class="btn btn-secondary" id="pauseBtn" onclick="togglePause()" style="display:none">⏸ Pause</button>
+    <button class="btn btn-danger" id="resetBtn" onclick="resetSim()" style="display:none">↺ Reset</button>
+
+    <hr class="divider" />
+    <p class="section-title">Progress</p>
+    <div id="progressLabel" style="font-size:0.75rem;color:var(--muted);margin-bottom:0.3rem">Idle</div>
+    <div class="progress-wrap">
+      <div class="progress-bar" id="progressBar" style="width:0%"></div>
+    </div>
+  </aside>
+
+  <!-- ── Dashboard ────────────────────────────────────────────────────── -->
+  <div class="dashboard">
+
+    <!-- KPI row -->
+    <div class="kpi-row">
+      <div class="kpi" style="--kpi-color: #58a6ff">
+        <div class="kpi-label">WAF</div>
+        <div class="kpi-value" id="kpiWAF">—</div>
+        <div class="kpi-sub">write amplification</div>
+      </div>
+      <div class="kpi" style="--kpi-color: #f0883e">
+        <div class="kpi-label">GC Cycles</div>
+        <div class="kpi-value" id="kpiGC">—</div>
+        <div class="kpi-sub" id="kpiGCSub">pages migrated: —</div>
+      </div>
+      <div class="kpi" style="--kpi-color: #3fb950">
+        <div class="kpi-label">Est. IOPS</div>
+        <div class="kpi-value" id="kpiIOPS">—</div>
+        <div class="kpi-sub" id="kpiIOPSSub">total ops: —</div>
+      </div>
+      <div class="kpi" style="--kpi-color: #a371f7">
+        <div class="kpi-label">Cache Hit%</div>
+        <div class="kpi-value" id="kpiCache">—</div>
+        <div class="kpi-sub" id="kpiCacheSub">coalesced: —</div>
+      </div>
+      <div class="kpi" style="--kpi-color: #f85149">
+        <div class="kpi-label">Wear Spread</div>
+        <div class="kpi-value" id="kpiWear">—</div>
+        <div class="kpi-sub" id="kpiWearSub">max erases: —</div>
+      </div>
+    </div>
+
+    <!-- Flash heatmap -->
+    <div class="card heatmap-card">
+      <div class="card-header">
+        <span class="card-title">NAND Flash Block Map</span>
+        <div class="legend">
+          <div class="legend-item"><div class="legend-dot" style="background:var(--free-color)"></div>Free</div>
+          <div class="legend-item"><div class="legend-dot" style="background:var(--valid-color)"></div>Valid</div>
+          <div class="legend-item"><div class="legend-dot" style="background:var(--invalid-color)"></div>Invalid</div>
+        </div>
+      </div>
+      <div id="blockGrid" class="block-grid"></div>
+    </div>
+
+    <!-- WAF and Erase charts -->
+    <div class="chart-row">
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">WAF Over Time</span>
+          <span class="card-subtitle" id="wafSubtitle">write amplification factor</span>
+        </div>
+        <canvas id="wafChart" height="160"></canvas>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">Erase Count Distribution</span>
+          <span class="card-subtitle" id="eraseSubtitle">per-block wear</span>
+        </div>
+        <canvas id="eraseChart" height="160"></canvas>
+      </div>
+    </div>
+
+    <!-- IOPS and Cache charts -->
+    <div class="chart-row">
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">IOPS Over Time</span>
+          <span class="card-subtitle">estimated host throughput</span>
+        </div>
+        <canvas id="iopsChart" height="160"></canvas>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <span class="card-title">Cache Performance</span>
+          <span class="card-subtitle" id="cacheChartSub">hit vs miss ratio</span>
+        </div>
+        <canvas id="cacheChart" height="160"></canvas>
+      </div>
+    </div>
+
+    <!-- Event log -->
+    <div class="log-panel">
+      <div class="log-header">
+        <span class="card-title">Event Log</span>
+        <span class="card-subtitle" id="logCount">0 events</span>
+      </div>
+      <div class="log-body" id="logBody"></div>
+    </div>
+
+  </div>
+</main>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════════
+// SSD Simulator — JavaScript engine (mirrors the C++ logic)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Constants ─────────────────────────────────────────────────────────────
+
+const PAGE_FREE    = 0;
+const PAGE_VALID   = 1;
+const PAGE_INVALID = 2;
+
+// ─── State ─────────────────────────────────────────────────────────────────
+
+let sim = null;
+let playback = null;
+let isPaused = false;
+let playbackSpeed = 5;   // ops per frame
+let logEntries = [];
+
+// ─── Simulation engine ─────────────────────────────────────────────────────
+
+function createSim(cfg) {
+  const { blocks, pages, peLimit, watermark, cacheSize, wlInterval, nandGrade } = cfg;
+
+  const latency = {
+    SLC: { read: 50,  write: 500,  erase: 2000,  dram: 0.1 },
+    MLC: { read: 70,  write: 1800, erase: 3500,  dram: 0.1 },
+    TLC: { read: 100, write: 3000, erase: 5000,  dram: 0.1 },
+  }[nandGrade] || { read: 70, write: 1800, erase: 3500, dram: 0.1 };
+
+  // Flash: blocks[b][p] = { state: PAGE_*, data }
+  const flash = Array.from({ length: blocks }, () => ({
+    pages: Array.from({ length: pages }, () => ({ state: PAGE_FREE, data: null })),
+    eraseCount: 0
+  }));
+
+  // FTL mapping table: lba -> { block, page }
+  const ftl = new Map();     // lba -> { block, page }
+  const ftlRev = new Map();  // "b,p" -> lba
+
+  // Cache: LRU doubly-linked list + map
+  const cacheMap = new Map();         // lba -> node
+  let cacheHead = null;               // MRU
+  let cacheTail = null;               // LRU
+  let cacheUsed = 0;
+
+  // Stats
+  const stats = {
+    logicalWrites:  0,
+    physicalWrites: 0,
+    logicalReads:   0,
+    gcCycles:       0,
+    pagesMigrated:  0,
+    staticWLPasses: 0,
+    readLatUs:  0,
+    writeLatUs: 0,
+    gcLatUs:    0,
+    cacheHits:  0,
+    cacheMisses: 0,
+    writesCoalesced: 0,
+    dirtyEvictions: 0,
+  };
+
+  let gcCyclesRun = 0;
+
+  // ── Flash helpers ───────────────────────────────────────────────────────
+
+  function getFreeCount() {
+    let c = 0;
+    flash.forEach(b => b.pages.forEach(p => { if (p.state === PAGE_FREE) c++; }));
+    return c;
+  }
+
+  function getTotalPages() { return blocks * pages; }
+
+  function findLeastUsedFreeBlock() {
+    let best = -1, lowestEC = Infinity;
+    flash.forEach((b, bi) => {
+      const hasFree = b.pages.some(p => p.state === PAGE_FREE);
+      if (hasFree && b.eraseCount < lowestEC) { lowestEC = b.eraseCount; best = bi; }
+    });
+    return best;
+  }
+
+  function getFreePageInBlock(bi) {
+    const idx = flash[bi].pages.findIndex(p => p.state === PAGE_FREE);
+    return idx;
+  }
+
+  function findFreeSlot(excludedBlock) {
+    for (let bi = 0; bi < blocks; bi++) {
+      if (bi === excludedBlock) continue;
+      const pi = getFreePageInBlock(bi);
+      if (pi !== -1) return { block: bi, page: pi };
+    }
+    return null;
+  }
+
+  // ── FTL helpers ─────────────────────────────────────────────────────────
+
+  function ftlSet(lba, block, page) {
+    const key = `${block},${page}`;
+    if (ftl.has(lba)) {
+      const old = ftl.get(lba);
+      ftlRev.delete(`${old.block},${old.page}`);
+    }
+    ftl.set(lba, { block, page });
+    ftlRev.set(key, lba);
+  }
+
+  function ftlRemove(lba) {
+    if (!ftl.has(lba)) return;
+    const { block, page } = ftl.get(lba);
+    ftlRev.delete(`${block},${page}`);
+    ftl.delete(lba);
+  }
+
+  function ftlRevLookup(block, page) {
+    return ftlRev.get(`${block},${page}`) ?? -1;
+  }
+
+  // ── Cache helpers (LRU doubly-linked list) ──────────────────────────────
+
+  function cacheRemoveNode(node) {
+    if (node.prev) node.prev.next = node.next; else cacheHead = node.next;
+    if (node.next) node.next.prev = node.prev; else cacheTail = node.prev;
+    node.prev = node.next = null;
+    cacheUsed--;
+  }
+
+  function cachePushFront(node) {
+    node.next = cacheHead;
+    node.prev = null;
+    if (cacheHead) cacheHead.prev = node;
+    cacheHead = node;
+    if (!cacheTail) cacheTail = node;
+    cacheUsed++;
+  }
+
+  function cacheEvictLRU() {
+    if (!cacheTail) return null;
+    const node = cacheTail;
+    cacheRemoveNode(node);
+    cacheMap.delete(node.lba);
+    if (node.dirty) stats.dirtyEvictions++;
+    return node.dirty ? node : null;
+  }
+
+  // Returns evicted dirty node (or null)
+  function cacheWrite(lba, data) {
+    if (cacheSize <= 0) return null;
+    if (cacheMap.has(lba)) {
+      const node = cacheMap.get(lba);
+      node.data = data;
+      node.dirty = true;
+      cacheRemoveNode(node);
+      cachePushFront(node);
+      stats.writesCoalesced++;
+      stats.cacheHits++;
+      return null;
+    }
+    stats.cacheMisses++;
+    let evicted = null;
+    if (cacheUsed >= cacheSize) evicted = cacheEvictLRU();
+    const node = { lba, data, dirty: true, prev: null, next: null };
+    cacheMap.set(lba, node);
+    cachePushFront(node);
+    return evicted;
+  }
+
+  function cacheRead(lba) {
+    if (cacheSize <= 0) return null;
+    if (!cacheMap.has(lba)) { stats.cacheMisses++; return null; }
+    const node = cacheMap.get(lba);
+    cacheRemoveNode(node);
+    cachePushFront(node);
+    stats.cacheHits++;
+    return node.data;
+  }
+
+  function cacheInsert(lba, data) {
+    if (cacheSize <= 0) return null;
+    if (cacheMap.has(lba)) {
+      const node = cacheMap.get(lba);
+      node.data = data; cacheRemoveNode(node); cachePushFront(node); return null;
+    }
+    let evicted = null;
+    if (cacheUsed >= cacheSize) evicted = cacheEvictLRU();
+    const node = { lba, data, dirty: false, prev: null, next: null };
+    cacheMap.set(lba, node);
+    cachePushFront(node);
+    return evicted;
+  }
+
+  function cacheFlushAll() {
+    const dirty = [];
+    let node = cacheHead;
+    while (node) { if (node.dirty) dirty.push({ lba: node.lba, data: node.data }); node = node.next; }
+    cacheHead = cacheTail = null; cacheUsed = 0; cacheMap.clear();
+    return dirty;
+  }
+
+  // ── GC ───────────────────────────────────────────────────────────────────
+
+  function selectVictim() {
+    let best = -1, mostInv = 0;
+    flash.forEach((b, bi) => {
+      const inv = b.pages.filter(p => p.state === PAGE_INVALID).length;
+      if (inv > mostInv) { mostInv = inv; best = bi; }
+    });
+    return best;
+  }
+
+  function runGC(log) {
+    const vi = selectVictim();
+    if (vi === -1) { log?.('info', '[GC] No reclaimable block.'); return false; }
+    const vb = flash[vi];
+    log?.('gc', `[GC] Cycle ${gcCyclesRun+1}  Victim=Block${vi} (inv=${vb.pages.filter(p=>p.state===PAGE_INVALID).length})`);
+    stats.gcCycles++;
+
+    vb.pages.forEach((p, pi) => {
+      if (p.state !== PAGE_VALID) return;
+      const lba = ftlRevLookup(vi, pi);
+      if (lba === -1) return;
+      const dst = findFreeSlot(vi);
+      if (!dst) return;
+      const dp = flash[dst.block].pages[dst.page];
+      dp.state = PAGE_VALID; dp.data = p.data;
+      ftlSet(lba, dst.block, dst.page);
+      stats.pagesMigrated++;
+      stats.physicalWrites++;
+      stats.gcLatUs += latency.write;
+      log?.('gc', `  Migrated LBA ${lba} (${vi},${pi}) → (${dst.block},${dst.page})`);
+    });
+
+    vb.pages.forEach(p => { p.state = PAGE_FREE; p.data = null; });
+    vb.eraseCount++;
+    stats.gcLatUs += latency.erase;
+    log?.('gc', `[GC] Block ${vi} erased (erase#${vb.eraseCount})`);
+
+    gcCyclesRun++;
+    if (wlInterval > 0 && gcCyclesRun % wlInterval === 0) runStaticWL(log);
+    return true;
+  }
+
+  function shouldGC() {
+    return getFreeCount() / getTotalPages() < watermark / 100;
+  }
+
+  const WEAR_THRESH = 3;
+
+  function findMostWornFreeBlock() {
+    let best = -1, highest = -1;
+    flash.forEach((b, bi) => {
+      if (b.pages.every(p => p.state === PAGE_FREE) && b.eraseCount > highest) {
+        highest = b.eraseCount; best = bi;
+      }
+    });
+    return best;
+  }
+
+  function findLeastWornDataBlock() {
+    let best = -1, lowest = Infinity;
+    flash.forEach((b, bi) => {
+      const hasValid = b.pages.some(p => p.state === PAGE_VALID);
+      if (hasValid && b.eraseCount < lowest) { lowest = b.eraseCount; best = bi; }
+    });
+    return best;
+  }
+
+  function runStaticWL(log) {
+    const srcI = findLeastWornDataBlock();
+    const dstI = findMostWornFreeBlock();
+    if (srcI === -1 || dstI === -1) { log?.('info', '[WL] No suitable src/dst.'); return false; }
+    const gap = flash[dstI].eraseCount - flash[srcI].eraseCount;
+    if (gap < WEAR_THRESH) { log?.('info', `[WL] Gap ${gap} < threshold — skip.`); return false; }
+
+    log?.('wl', `[WL] Static WL: src=Block${srcI} (ec=${flash[srcI].eraseCount}) → dst=Block${dstI} (ec=${flash[dstI].eraseCount}), gap=${gap}`);
+    flash[srcI].pages.forEach((p, pi) => {
+      if (p.state !== PAGE_VALID) return;
+      const lba = ftlRevLookup(srcI, pi);
+      if (lba === -1) return;
+      const fp = flash[dstI].pages.findIndex(dp => dp.state === PAGE_FREE);
+      if (fp === -1) return;
+      flash[dstI].pages[fp].state = PAGE_VALID;
+      flash[dstI].pages[fp].data  = p.data;
+      ftlSet(lba, dstI, fp);
+      stats.pagesMigrated++;
+      stats.physicalWrites++;
+      stats.gcLatUs += latency.write;
+    });
+    flash[srcI].pages.forEach(p => { p.state = PAGE_FREE; p.data = null; });
+    flash[srcI].eraseCount++;
+    stats.gcLatUs += latency.erase;
+    stats.staticWLPasses++;
+    log?.('wl', `[WL] Block${srcI} erased → fresh for writes.`);
+    return true;
+  }
+
+  // ── NAND write (low-level) ────────────────────────────────────────────────
+
+  function nandWrite(lba, data, log) {
+    if (shouldGC()) runGC(log);
+
+    let bi = findLeastUsedFreeBlock();
+    if (bi === -1) { runGC(log); bi = findLeastUsedFreeBlock(); }
+    if (bi === -1) { log?.('err', `[SSD] FULL — cannot write LBA ${lba}`); return; }
+
+    const pi = getFreePageInBlock(bi);
+    flash[bi].pages[pi].state = PAGE_VALID;
+    flash[bi].pages[pi].data  = data;
+
+    stats.physicalWrites++;
+    stats.writeLatUs += latency.write;
+
+    if (ftl.has(lba)) {
+      const old = ftl.get(lba);
+      flash[old.block].pages[old.page].state = PAGE_INVALID;
+    }
+    ftlSet(lba, bi, pi);
+  }
+
+  // ── Host write / read ─────────────────────────────────────────────────────
+
+  function hostWrite(lba, data, log) {
+    stats.logicalWrites++;
+    if (cacheSize > 0) {
+      const evicted = cacheWrite(lba, data);
+      if (evicted) nandWrite(evicted.lba, evicted.data, log);
+    } else {
+      nandWrite(lba, data, log);
+    }
+  }
+
+  function hostRead(lba, log) {
+    stats.logicalReads++;
+    if (cacheSize > 0) {
+      const hit = cacheRead(lba);
+      if (hit !== null) { stats.readLatUs += latency.dram; return hit; }
+    }
+    if (!ftl.has(lba)) return null;
+    const { block, page } = ftl.get(lba);
+    stats.readLatUs += latency.read;
+    const data = flash[block].pages[page].data;
+    if (cacheSize > 0) {
+      const evicted = cacheInsert(lba, data);
+      if (evicted) nandWrite(evicted.lba, evicted.data, log);
+    }
+    return data;
+  }
+
+  function flushCache(log) {
+    const dirty = cacheFlushAll();
+    if (dirty.length) log?.('info', `[Cache] Flushing ${dirty.length} dirty entries.`);
+    dirty.forEach(e => nandWrite(e.lba, e.data, log));
+  }
+
+  // ── Derived metrics ───────────────────────────────────────────────────────
+
+  function getWAF() {
+    return stats.logicalWrites > 0 ? stats.physicalWrites / stats.logicalWrites : 0;
+  }
+
+  function getTotalSimUs() { return stats.readLatUs + stats.writeLatUs + stats.gcLatUs; }
+
+  function getIOPS() {
+    const t = getTotalSimUs();
+    if (t <= 0) return 0;
+    return ((stats.logicalReads + stats.logicalWrites) / t) * 1e6;
+  }
+
+  function getCacheHitRatio() {
+    const tot = stats.cacheHits + stats.cacheMisses;
+    return tot > 0 ? (stats.cacheHits / tot * 100) : 0;
+  }
+
+  function getMaxErase() { return Math.max(...flash.map(b => b.eraseCount)); }
+  function getMinErase() { return Math.min(...flash.map(b => b.eraseCount)); }
+
+  return {
+    flash, ftl, stats, latency,
+    hostWrite, hostRead, flushCache, runGC,
+    getWAF, getIOPS, getCacheHitRatio, getMaxErase, getMinErase,
+    shouldGC,
+    snapshot: () => ({
+      waf:   getWAF(),
+      iops:  getIOPS(),
+      gc:    stats.gcCycles,
+      mig:   stats.pagesMigrated,
+      wlp:   stats.staticWLPasses,
+      hitR:  getCacheHitRatio(),
+      coals: stats.writesCoalesced,
+      maxEC: getMaxErase(),
+      minEC: getMinErase(),
+      reads: stats.logicalReads,
+      writes: stats.logicalWrites,
+    }),
+  };
+}
+
+// ─── Workload generator ─────────────────────────────────────────────────────
+
+function buildWorkload(cfg) {
+  const { coldLbas, hotLbas, hotRounds } = cfg;
+  const ops = [];
+
+  // Phase A: cold fill
+  for (let i = 0; i < coldLbas; i++) {
+    const lba = i * 10;
+    ops.push({ type: 'W', lba, data: `cold_lba${lba}`, tag: 'cold' });
+  }
+
+  // Phase B: hot rewrites
+  const hotSet = Array.from({ length: hotLbas }, (_, i) => 200 + i * 10);
+  for (let r = 0; r < hotRounds; r++) {
+    for (const lba of hotSet) {
+      ops.push({ type: 'W', lba, data: `hot_r${r}_lba${lba}`, tag: 'hot' });
+    }
+  }
+
+  // Phase C: reads
+  for (let i = 0; i < coldLbas; i++) ops.push({ type: 'R', lba: i * 10, tag: 'read' });
+  for (const lba of hotSet)          ops.push({ type: 'R', lba, tag: 'read' });
+
+  return ops;
+}
+
+// ─── Chart drawing (vanilla Canvas) ─────────────────────────────────────────
+
+function drawLineChart(canvas, data, color, label, yMax, yUnit = '') {
+  const ctx = canvas.getContext('2d');
+  const W = canvas.parentElement.clientWidth - 48;
+  const H = 160;
+  canvas.width  = W;
+  canvas.height = H;
+
+  ctx.clearRect(0, 0, W, H);
+
+  if (data.length === 0) {
+    ctx.fillStyle = '#8b949e';
+    ctx.font = '12px Inter, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('No data yet', W / 2, H / 2);
+    return;
+  }
+
+  const pad = { top: 12, right: 16, bottom: 28, left: 44 };
+  const cW = W - pad.left - pad.right;
+  const cH = H - pad.top - pad.bottom;
+
+  const max = yMax || Math.max(...data, 0.001);
+  const xStep = cW / Math.max(data.length - 1, 1);
+
+  // Grid lines
+  ctx.strokeStyle = '#30363d';
+  ctx.lineWidth = 1;
+  for (let g = 0; g <= 4; g++) {
+    const y = pad.top + cH - (g / 4) * cH;
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(W - pad.right, y); ctx.stroke();
+    ctx.fillStyle = '#8b949e';
+    ctx.font = '10px JetBrains Mono, monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText(`${((g / 4) * max).toFixed(yUnit === 'x' ? 2 : 0)}${yUnit}`, pad.left - 4, y + 3);
+  }
+
+  // Gradient fill
+  const grad = ctx.createLinearGradient(0, pad.top, 0, H - pad.bottom);
+  grad.addColorStop(0, color + '55');
+  grad.addColorStop(1, color + '08');
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  data.forEach((v, i) => {
+    const x = pad.left + i * xStep;
+    const y = pad.top + cH - (v / max) * cH;
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.lineTo(pad.left + (data.length - 1) * xStep, H - pad.bottom);
+  ctx.lineTo(pad.left, H - pad.bottom);
+  ctx.closePath(); ctx.fill();
+
+  // Line
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  data.forEach((v, i) => {
+    const x = pad.left + i * xStep;
+    const y = pad.top + cH - (v / max) * cH;
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+
+  // Last value dot
+  const lx = pad.left + (data.length - 1) * xStep;
+  const ly = pad.top + cH - (data[data.length - 1] / max) * cH;
+  ctx.beginPath(); ctx.arc(lx, ly, 4, 0, Math.PI * 2);
+  ctx.fillStyle = color; ctx.fill();
+
+  // X label
+  ctx.fillStyle = '#8b949e'; ctx.font = '10px Inter, sans-serif'; ctx.textAlign = 'center';
+  ctx.fillText(label, pad.left + cW / 2, H - 4);
+}
+
+function drawBarChart(canvas, values, maxVal, colors, labels) {
+  const ctx = canvas.getContext('2d');
+  const W = canvas.parentElement.clientWidth - 48;
+  const H = 160;
+  canvas.width  = W;
+  canvas.height = H;
+  ctx.clearRect(0, 0, W, H);
+
+  if (!values.length) {
+    ctx.fillStyle = '#8b949e'; ctx.font = '12px Inter'; ctx.textAlign = 'center';
+    ctx.fillText('No data yet', W / 2, H / 2);
+    return;
+  }
+
+  const pad = { top: 12, right: 8, bottom: 24, left: 36 };
+  const cW  = W - pad.left - pad.right;
+  const cH  = H - pad.top - pad.bottom;
+  const n   = values.length;
+  const barW = Math.max(4, (cW / n) * 0.7);
+  const gap  = cW / n;
+  const max  = maxVal || Math.max(...values, 1);
+
+  // Grid
+  ctx.strokeStyle = '#30363d'; ctx.lineWidth = 1;
+  for (let g = 0; g <= 4; g++) {
+    const y = pad.top + cH - (g / 4) * cH;
+    ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(W - pad.right, y); ctx.stroke();
+    ctx.fillStyle = '#8b949e'; ctx.font = '10px JetBrains Mono'; ctx.textAlign = 'right';
+    ctx.fillText(Math.round((g / 4) * max), pad.left - 4, y + 3);
+  }
+
+  values.forEach((v, i) => {
+    const x = pad.left + i * gap + (gap - barW) / 2;
+    const barH = Math.max(1, (v / max) * cH);
+    const y = pad.top + cH - barH;
+
+    // Worn-out flicker
+    const fillColor = (v >= maxVal && maxVal > 0) ? '#f85149' : (colors[i] || '#58a6ff');
+    ctx.fillStyle = fillColor + 'cc';
+    ctx.beginPath();
+    ctx.roundRect(x, y, barW, barH, 3);
+    ctx.fill();
+
+    // Label
+    if (labels && labels[i] !== undefined) {
+      ctx.fillStyle = '#8b949e'; ctx.font = '9px Inter'; ctx.textAlign = 'center';
+      ctx.fillText(labels[i], x + barW / 2, H - 6);
+    }
+  });
+}
+
+function drawCachePieish(canvas, hits, misses) {
+  const ctx = canvas.getContext('2d');
+  const W = canvas.parentElement.clientWidth - 48;
+  const H = 160;
+  canvas.width  = W;
+  canvas.height = H;
+  ctx.clearRect(0, 0, W, H);
+
+  const total = hits + misses;
+  if (total === 0) {
+    ctx.fillStyle = '#8b949e'; ctx.font = '12px Inter'; ctx.textAlign = 'center';
+    ctx.fillText('No cache activity', W / 2, H / 2);
+    return;
+  }
+
+  const r = Math.min(W, H) * 0.35;
+  const cx = W / 2, cy = H / 2;
+  const hitAngle = (hits / total) * Math.PI * 2;
+
+  // Hit slice
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.arc(cx, cy, r, -Math.PI / 2, -Math.PI / 2 + hitAngle);
+  ctx.closePath();
+  ctx.fillStyle = '#3fb95099';
+  ctx.fill();
+
+  // Miss slice
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.arc(cx, cy, r, -Math.PI / 2 + hitAngle, -Math.PI / 2 + Math.PI * 2);
+  ctx.closePath();
+  ctx.fillStyle = '#f8514966';
+  ctx.fill();
+
+  // Inner hole (donut)
+  ctx.beginPath();
+  ctx.arc(cx, cy, r * 0.55, 0, Math.PI * 2);
+  ctx.fillStyle = '#161b22';
+  ctx.fill();
+
+  // Center text
+  ctx.fillStyle = '#e6edf3';
+  ctx.font = `bold ${Math.round(r * 0.42)}px JetBrains Mono`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(`${(hits/total*100).toFixed(0)}%`, cx, cy - 4);
+  ctx.font = `${Math.round(r * 0.22)}px Inter`;
+  ctx.fillStyle = '#8b949e';
+  ctx.fillText('hit rate', cx, cy + r * 0.28);
+
+  // Legend
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  ctx.font = '11px Inter';
+  ctx.fillStyle = '#3fb950'; ctx.fillRect(8, H - 26, 10, 10);
+  ctx.fillStyle = '#e6edf3'; ctx.fillText(`Hits: ${hits}`, 22, H - 17);
+  ctx.fillStyle = '#f85149'; ctx.fillRect(8, H - 13, 10, 10);
+  ctx.fillStyle = '#e6edf3'; ctx.fillText(`Misses: ${misses}`, 22, H - 4);
+}
+
+// ─── Block heatmap ──────────────────────────────────────────────────────────
+
+function buildHeatmap(flash, peLimit) {
+  const grid = document.getElementById('blockGrid');
+  grid.innerHTML = '';
+
+  flash.forEach((block, bi) => {
+    const item = document.createElement('div');
+    item.className = 'block-item';
+    item.id = `block-${bi}`;
+    if (block.eraseCount >= peLimit) item.classList.add('worn');
+
+    const pagesPerRow = Math.ceil(Math.sqrt(block.pages.length));
+    item.innerHTML = `<div class="block-label">B${bi} | EC:${block.eraseCount}</div>
+      <div class="page-grid" style="grid-template-columns:repeat(${pagesPerRow},1fr)" id="pages-${bi}"></div>
+      <div class="block-stats">
+        <span class="bs-free">F:${block.pages.filter(p=>p.state===PAGE_FREE).length}</span>
+        <span class="bs-valid">V:${block.pages.filter(p=>p.state===PAGE_VALID).length}</span>
+        <span class="bs-invalid">I:${block.pages.filter(p=>p.state===PAGE_INVALID).length}</span>
+        <span class="bs-erase">×${block.eraseCount}</span>
+      </div>`;
+
+    const pg = item.querySelector(`#pages-${bi}`);
+    block.pages.forEach((p, pi) => {
+      const cell = document.createElement('div');
+      cell.className = 'page-cell ' + (['free','valid','invalid'][p.state] || 'free');
+      cell.id = `cell-${bi}-${pi}`;
+      pg.appendChild(cell);
+    });
+
+    grid.appendChild(item);
+  });
+}
+
+function updateHeatmap(flash, peLimit) {
+  flash.forEach((block, bi) => {
+    const item = document.getElementById(`block-${bi}`);
+    if (!item) return;
+    item.className = 'block-item' + (block.eraseCount >= peLimit ? ' worn' : '');
+    item.querySelector('.block-label').textContent = `B${bi} | EC:${block.eraseCount}`;
+    const stats = item.querySelector('.block-stats');
+    stats.innerHTML = `<span class="bs-free">F:${block.pages.filter(p=>p.state===PAGE_FREE).length}</span>
+      <span class="bs-valid">V:${block.pages.filter(p=>p.state===PAGE_VALID).length}</span>
+      <span class="bs-invalid">I:${block.pages.filter(p=>p.state===PAGE_INVALID).length}</span>
+      <span class="bs-erase">×${block.eraseCount}</span>`;
+    block.pages.forEach((p, pi) => {
+      const cell = document.getElementById(`cell-${bi}-${pi}`);
+      if (!cell) return;
+      const cls = ['free','valid','invalid'][p.state] || 'free';
+      if (!cell.classList.contains(cls)) {
+        cell.className = 'page-cell ' + cls + ' flash-write';
+        setTimeout(() => cell.classList.remove('flash-write'), 500);
+      }
+    });
+  });
+}
+
+// ─── KPI update ─────────────────────────────────────────────────────────────
+
+function setKPI(id, value, subId, sub) {
+  const el = document.getElementById(id);
+  el.textContent = value;
+  el.classList.remove('pulse');
+  void el.offsetWidth;
+  el.classList.add('pulse');
+  if (subId && sub !== undefined) document.getElementById(subId).textContent = sub;
+}
+
+// ─── Log ────────────────────────────────────────────────────────────────────
+
+function addLog(type, msg) {
+  logEntries.push({ type, msg, ts: Date.now() });
+  if (logEntries.length > 200) logEntries.shift();
+  const body = document.getElementById('logBody');
+  const line = document.createElement('div');
+  line.className = 'log-entry ' + type;
+  line.textContent = msg;
+  body.appendChild(line);
+  body.scrollTop = body.scrollHeight;
+  document.getElementById('logCount').textContent = `${logEntries.length} events`;
+}
+
+// ─── Charts history ──────────────────────────────────────────────────────────
+
+const history = { waf: [], iops: [], gc: [], cacheHit: [] };
+
+function updateCharts(snap, peLimit) {
+  const N = 80;
+  history.waf.push(snap.waf);
+  history.iops.push(snap.iops);
+  history.gc.push(snap.gc);
+  history.cacheHit.push(snap.hitR);
+  if (history.waf.length > N)  history.waf.shift();
+  if (history.iops.length > N) history.iops.shift();
+  if (history.gc.length > N)   history.gc.shift();
+  if (history.cacheHit.length > N) history.cacheHit.shift();
+
+  drawLineChart(document.getElementById('wafChart'),  history.waf,    '#58a6ff', 'Operation index →', null, 'x');
+  drawLineChart(document.getElementById('iopsChart'), history.iops,   '#3fb950', 'Operation index →', null, '');
+}
+
+function updateEraseChart(flash, peLimit) {
+  const values = flash.map(b => b.eraseCount);
+  const colors = flash.map(b => b.eraseCount >= peLimit ? '#f85149' : '#58a6ff');
+  const labels = flash.map((_, i) => `B${i}`);
+  drawBarChart(document.getElementById('eraseChart'), values, peLimit, colors, labels);
+}
+
+function updateCacheChart(stats) {
+  drawCachePieish(document.getElementById('cacheChart'), stats.cacheHits, stats.cacheMisses);
+}
+
+// ─── Main simulation loop ────────────────────────────────────────────────────
+
+function startSim() {
+  resetSim();
+
+  const cfg = {
+    blocks:    +document.getElementById('blocksRange').value,
+    pages:     +document.getElementById('pagesRange').value,
+    peLimit:   +document.getElementById('peRange').value,
+    watermark: +document.getElementById('wmRange').value,
+    cacheSize: +document.getElementById('cacheRange').value,
+    wlInterval:+document.getElementById('wlRange').value,
+    nandGrade:  document.getElementById('nandGrade').value,
+    coldLbas:  +document.getElementById('coldRange').value,
+    hotLbas:   +document.getElementById('hotLbaRange').value,
+    hotRounds: +document.getElementById('hotRndRange').value,
+  };
+
+  sim = createSim(cfg);
+  const workload = buildWorkload(cfg);
+  const totalOps = workload.length;
+  let opIdx = 0;
+
+  buildHeatmap(sim.flash, cfg.peLimit);
+
+  document.getElementById('runBtn').style.display   = 'none';
+  document.getElementById('pauseBtn').style.display = 'inline-block';
+  document.getElementById('resetBtn').style.display = 'inline-block';
+  document.getElementById('statusBadge').textContent = 'Running';
+  document.getElementById('statusBadge').className   = 'badge live';
+
+  addLog('ok', `[SIM] Starting: ${cfg.blocks}B×${cfg.pages}P, PE=${cfg.peLimit}, cache=${cfg.cacheSize}`);
+
+  const batchSize = playbackSpeed === 0 ? totalOps : playbackSpeed;
+
+  function step() {
+    if (isPaused) { playback = requestAnimationFrame(step); return; }
+
+    const end = Math.min(opIdx + batchSize, totalOps);
+    for (let i = opIdx; i < end; i++) {
+      const op = workload[i];
+      if (op.type === 'W') {
+        sim.hostWrite(op.lba, op.data, (t, m) => addLog(t, m));
+      } else {
+        sim.hostRead(op.lba, (t, m) => addLog(t, m));
+      }
+    }
+    opIdx = end;
+
+    const pct = Math.round((opIdx / totalOps) * 100);
+    document.getElementById('progressBar').style.width   = pct + '%';
+    document.getElementById('progressLabel').textContent = `${opIdx} / ${totalOps} ops (${pct}%)`;
+
+    const snap = sim.snapshot();
+    setKPI('kpiWAF',   snap.waf.toFixed(2) + 'x', null);
+    setKPI('kpiGC',    snap.gc, 'kpiGCSub',    `pages migrated: ${snap.mig}`);
+    setKPI('kpiIOPS',  Math.round(snap.iops), 'kpiIOPSSub', `total ops: ${snap.reads+snap.writes}`);
+    setKPI('kpiCache', snap.hitR.toFixed(0) + '%', 'kpiCacheSub', `coalesced: ${snap.coals}`);
+    setKPI('kpiWear',  (snap.maxEC - snap.minEC), 'kpiWearSub', `max erases: ${snap.maxEC}`);
+
+    updateHeatmap(sim.flash, cfg.peLimit);
+    updateCharts(snap, cfg.peLimit);
+    updateEraseChart(sim.flash, cfg.peLimit);
+    updateCacheChart(sim.stats);
+
+    if (opIdx < totalOps) {
+      playback = requestAnimationFrame(step);
+    } else {
+      // Flush cache at end
+      sim.flushCache((t, m) => addLog(t, m));
+      updateHeatmap(sim.flash, cfg.peLimit);
+      updateEraseChart(sim.flash, cfg.peLimit);
+
+      document.getElementById('statusBadge').textContent = 'Complete';
+      document.getElementById('statusBadge').className   = 'badge';
+      document.getElementById('pauseBtn').style.display  = 'none';
+      addLog('ok', `[SIM] Done! WAF=${sim.getWAF().toFixed(2)}x, GC=${sim.stats.gcCycles}, IOPS≈${Math.round(sim.getIOPS())}`);
+    }
+  }
+
+  playback = requestAnimationFrame(step);
+}
+
+function togglePause() {
+  isPaused = !isPaused;
+  document.getElementById('pauseBtn').textContent = isPaused ? '▶ Resume' : '⏸ Pause';
+  document.getElementById('statusBadge').textContent = isPaused ? 'Paused' : 'Running';
+}
+
+function resetSim() {
+  if (playback) cancelAnimationFrame(playback);
+  playback = null;
+  isPaused = false;
+  sim = null;
+
+  history.waf.length = history.iops.length = history.gc.length = history.cacheHit.length = 0;
+  logEntries.length = 0;
+  document.getElementById('logBody').innerHTML = '';
+  document.getElementById('logCount').textContent = '0 events';
+  document.getElementById('blockGrid').innerHTML = '';
+  document.getElementById('progressBar').style.width = '0%';
+  document.getElementById('progressLabel').textContent = 'Idle';
+
+  ['kpiWAF','kpiGC','kpiIOPS','kpiCache','kpiWear'].forEach(id => {
+    document.getElementById(id).textContent = '—';
+  });
+  ['kpiGCSub','kpiIOPSSub','kpiCacheSub','kpiWearSub'].forEach(id => {
+    document.getElementById(id).textContent = '—';
+  });
+
+  ['wafChart','iopsChart','eraseChart','cacheChart'].forEach(id => {
+    const c = document.getElementById(id);
+    const ctx = c.getContext('2d');
+    ctx.clearRect(0, 0, c.width, c.height);
+  });
+
+  document.getElementById('runBtn').style.display   = 'inline-block';
+  document.getElementById('pauseBtn').style.display = 'none';
+  document.getElementById('resetBtn').style.display = 'none';
+  document.getElementById('pauseBtn').textContent   = '⏸ Pause';
+  document.getElementById('statusBadge').textContent = 'Ready';
+  document.getElementById('statusBadge').className   = 'badge live';
+}
+
+function setSpeed(n) {
+  playbackSpeed = n;
+  document.querySelectorAll('.speed-btn').forEach(b => b.classList.remove('active'));
+  const idMap = {1:'sp1', 5:'sp5', 20:'sp20', 0:'sp0'};
+  document.getElementById(idMap[n])?.classList.add('active');
+}
+
+// ─── Init ────────────────────────────────────────────────────────────────────
+
+window.addEventListener('load', () => {
+  // Draw empty chart placeholders
+  ['wafChart','iopsChart','eraseChart','cacheChart'].forEach(id => {
+    const c = document.getElementById(id);
+    c.width  = c.parentElement.clientWidth - 48;
+    c.height = 160;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#8b949e';
+    ctx.font = '12px Inter, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Configure and click ▶ Run Simulation', c.width / 2, 80);
+  });
+});
+
+// Tooltip for block cells
+document.addEventListener('mousemove', e => {
+  const tip = document.getElementById('tooltip');
+  const cell = e.target.closest('.page-cell');
+  if (cell) {
+    const [,bi,pi] = cell.id.split('-').map(Number);
+    if (sim && sim.flash[bi]) {
+      const p = sim.flash[bi].pages[pi];
+      const stateLabel = ['Free','Valid','Invalid'][p.state] || '?';
+      const lba = p.state === PAGE_VALID
+        ? (() => { const k = `${bi},${pi}`; return sim.ftl ? [...sim.ftl.entries()].find(([,v]) => v.block===bi&&v.page===pi)?.[0] ?? '?' : '?'; })()
+        : '—';
+      tip.textContent = `Block ${bi}  Page ${pi}  State: ${stateLabel}  LBA: ${lba}`;
+      tip.style.display = 'block';
+      tip.style.left = (e.clientX + 14) + 'px';
+      tip.style.top  = (e.clientY + 8)  + 'px';
+    }
+  } else {
+    tip.style.display = 'none';
+  }
+});
+</script>
+</body>
+</html>
